@@ -25,9 +25,7 @@ pub struct CursorDB {
 }
 
 impl CursorDB {
-    // --------------------------------------------------
-    // OPEN / CREATE
-    // --------------------------------------------------
+
     pub fn open_or_create(data_path: &str, index_path: &str) -> std::io::Result<Self> {
         let data_file = OpenOptions::new()
             .create(true)
