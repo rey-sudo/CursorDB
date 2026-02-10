@@ -1,0 +1,2 @@
+# CursorDB
+ Cursor DB Rust
