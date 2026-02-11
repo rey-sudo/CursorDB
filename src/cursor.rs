@@ -31,20 +31,24 @@ pub struct DBStats {
     pub average_record_size: u64,
 }
 impl CursorDB {
+    /// Returns the current logical row index where the cursor is positioned.
     pub fn current_row(&self) -> u64 {
         self.current_row
     }
+    /// Returns the total number of records found in the database.
     pub fn total_rows(&self) -> u64 {
         self.total_rows
     }
+    /// Returns the number of entries currently stored in the sparse index.
     pub fn index_len(&self) -> usize {
         self.index.len()
     }
-
+    /// Returns the current physical byte offset in the data file.
     pub fn current_offset(&self) -> u64 {
         self.current_offset
     }
-
+    /// Generates a snapshot of the database health and storage metrics.
+    /// Performs an O(1) operation by querying file metadata and internal counters.
     pub fn stats(&self) -> std::io::Result<DBStats> {
         let data_len: u64 = self.data_file.metadata()?.len();
 
@@ -62,19 +66,38 @@ impl CursorDB {
             },
         })
     }
+
+    /// Opens the database files or creates them if they do not exist.
+    ///
+    /// This constructor initializes the raw data storage and the sparse index tracker.
+    /// It assumes a "pure data" format where the record stream begins at the very
+    /// first byte of the file (offset 0).
+    ///
+    /// # Arguments
+    /// * `data_path` - Path to the `.cdb` binary data file.
+    /// * `index_path` - Path to the `.cdbi` sparse index file.
+    ///
+    /// # Implementation Details
+    /// * Uses `write(true)` instead of `append` to allow granular cursor positioning
+    ///   and overwriting if necessary.
+    /// * Initializes the cursor at the "Kilometer Zero" (offset 0, row 0).
+    /// * Triggers an immediate `load_index()` to reconcile memory state with disk content.
     pub fn open_or_create(data_path: &str, index_path: &str) -> std::io::Result<Self> {
-        let data_file = OpenOptions::new()
+        // Open the primary data container. CRW access is required for cursor-based navigation.
+        let data_file: File = OpenOptions::new()
             .create(true)
             .read(true)
-            .write(true) // Usamos write en lugar de append para control total del cursor
+            .write(true)
             .open(data_path)?;
 
-        let index_file = OpenOptions::new()
+        // Open the companion index file.
+        let index_file: File = OpenOptions::new()
             .create(true)
             .read(true)
             .write(true)
             .open(index_path)?;
 
+        // Initialize the database instance with a clean state.
         let mut db: CursorDB = Self {
             data_file,
             index_file,
@@ -84,7 +107,6 @@ impl CursorDB {
             total_rows: 0,
         };
 
-        // Cargar lo que existe en el índice y luego buscar registros huérfanos
         db.load_index()?;
 
         Ok(db)
