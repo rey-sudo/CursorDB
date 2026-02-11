@@ -1,4 +1,5 @@
 use crate::record::Record;
+use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 
@@ -24,12 +25,87 @@ pub struct CursorDB {
 
 #[derive(Debug)]
 pub struct DBStats {
+    /// Total count of records currently tracked by the cursor logic.
     pub total_records: u64,
+    /// Physical size of the .cdb file on disk.
     pub data_file_size_bytes: u64,
+    /// Number of checkpoints in the .cdbi file.
     pub index_entries: usize,
+    /// Exact memory allocation for the sparse index in RAM.
     pub index_ram_usage_bytes: usize,
+    /// Theoretical average size of a record (Total Bytes / Total Records).
     pub average_record_size: u64,
+    /// Index Density: Average physical distance (in bytes) between index entries.
+    /// Lower values mean faster seeking but higher RAM usage.
+    pub index_interval_bytes: u64,
+    /// Orphan Ratio: Percentage of the data file that is not yet indexed.
+    /// Useful for triggering an automated index flush.
+    pub orphan_data_ratio: f64,
 }
+impl DBStats {
+    /// Converts a raw byte count into a human-readable string (e.g., 300.00 GB).
+    ///
+    /// This function uses the JEDEC binary standard (1024-based) to scale the
+    /// value through units: B, KB, MB, GB, and TB.    
+    fn format_bytes(bytes: u64) -> String {
+        // Define the magnitude labels for the binary system.
+        let labels: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+
+        // Convert to f64 to maintain precision during successive divisions.
+        let mut size: f64 = bytes as f64;
+        let mut unit_idx: usize = 0;
+
+        // Iterate while the value is at least one unit of the next magnitude
+        // AND we haven't reached the end of our unit labels (to avoid index out of bounds).
+        while size >= 1024.0 && unit_idx < labels.len() - 1 {
+            size /= 1024.0; // Compound assignment: scale down the value by 1024.
+            unit_idx += 1; // Move to the next unit index (e.g., from MB to GB).
+        }
+
+        format!("{:.2} {}", size, labels[unit_idx])
+    }
+}
+
+impl fmt::Display for DBStats {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "\n🗎 CursorDB Statistics Report")?;
+        writeln!(f, "{}", "━".repeat(35))?;
+        writeln!(f, "{:<22}: {}", "Total Records", self.total_records)?;
+        writeln!(
+            f,
+            "{:<22}: {}",
+            "Data Storage Size",
+            Self::format_bytes(self.data_file_size_bytes)
+        )?;
+        writeln!(f, "{:<22}: {}", "Index Entries", self.index_entries)?;
+        writeln!(
+            f,
+            "{:<22}: {}",
+            "Index RAM Usage",
+            Self::format_bytes(self.index_ram_usage_bytes as u64)
+        )?;
+        writeln!(
+            f,
+            "{:<22}: {}",
+            "Avg Record Size",
+            Self::format_bytes(self.average_record_size)
+        )?;
+        writeln!(f, "{}", "━".repeat(35))?;
+
+        if self.orphan_data_ratio > 0.1 {
+            writeln!(
+                f,
+                "⚠️  Warning: {:.1}% of data is unindexed",
+                self.orphan_data_ratio
+            )?;
+        } else {
+            writeln!(f, "✓ Index is synchronized")?;
+        }
+
+        Ok(())
+    }
+}
+
 impl CursorDB {
     /// Returns the current logical row index where the cursor is positioned.
     pub fn current_row(&self) -> u64 {
@@ -51,18 +127,45 @@ impl CursorDB {
     /// Performs an O(1) operation by querying file metadata and internal counters.
     pub fn stats(&self) -> std::io::Result<DBStats> {
         let data_len: u64 = self.data_file.metadata()?.len();
+        let index_len: usize = self.index.len();
 
-        let index_ram_usage: usize = self.index.capacity() * std::mem::size_of::<IndexEntry>();
+        // Calculate the last indexed physical position
+        let last_indexed_offset: u64 = self
+            .index
+            .last()
+            .map(|e: &IndexEntry| e.file_offset)
+            .unwrap_or(0);
+
+        // Orphan ratio: How much data exists beyond the current cursor
+        let orphan_bytes: u64 = if data_len > self.current_offset {
+            data_len - self.current_offset
+        } else {
+            0
+        };
 
         Ok(DBStats {
             total_records: self.total_rows,
             data_file_size_bytes: data_len,
-            index_entries: self.index.len(),
-            index_ram_usage_bytes: index_ram_usage,
+            index_entries: index_len,
+            index_ram_usage_bytes: self.index.capacity() * std::mem::size_of::<IndexEntry>(),
             average_record_size: if self.total_rows > 0 {
                 data_len / self.total_rows
             } else {
                 0
+            },
+
+            // Deterministic distance between index markers
+            index_interval_bytes: if index_len > 1 {
+                last_indexed_offset / (index_len as u64)
+            } else {
+                0
+            },
+
+            // Percentage of data "in the dark" (appended but not yet indexed)
+            orphan_data_ratio: if data_len > 0 {
+                (orphan_bytes as f64 / data_len as f64) * 100.0
+            } else {
+                0.0
             },
         })
     }

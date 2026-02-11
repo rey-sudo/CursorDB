@@ -1,4 +1,5 @@
 use cursor_db::cursor::CursorDB;
+use cursor_db::cursor::DBStats;
 use cursor_db::record::Record;
 fn main() -> std::io::Result<()> {
     let mut db: CursorDB = CursorDB::open_or_create("data/data.cdb", "data/index.cdbi")?;
@@ -11,24 +12,8 @@ fn main() -> std::io::Result<()> {
         }
     */
 
-    match db.stats() {
-        Ok(s) => {
-            println!("--- REPORTE DE SISTEMA ---");
-            println!("Registros totales: {}", s.total_records);
-            println!(
-                "Tamaño en disco:   {:.2} GB",
-                s.data_file_size_bytes as f64 / 1024.0 / 1024.0 / 1024.0
-            );
-            println!("Entradas en índice: {}", s.index_entries);
-            println!(
-                "Índice en RAM:     {:.2} KB",
-                s.index_ram_usage_bytes as f64 / 1024.0
-            );
-            println!("Tamaño prom. reg:  {} bytes", s.average_record_size);
-            println!("--------------------------");
-        }
-        Err(e) => println!("No se pudieron obtener estadísticas: {}", e),
-    }
+    let stats: DBStats = db.stats()?;
+    println!("{}", stats);
 
     match db.move_cursor_at(0) {
         Some(r) => println!("Encontrado: {}", r.timestamp),
@@ -79,7 +64,7 @@ fn main() -> std::io::Result<()> {
     let mut count: i32 = 0;
     while count < 5 {
         match db.next() {
-            Some(record) => match db.current() {
+            Some(_record) => match db.current() {
                 Some(rec) => println!("Registro actual: {:?}", rec.timestamp),
                 None => println!("La base de datos está vacía."),
             },
