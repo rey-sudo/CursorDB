@@ -5,6 +5,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 
 const INDEX_STRIDE: u64 = 1024;
+const MAX_PAYLOAD_SIZE: usize = 16 * 1024 * 1024;
 
 /// Represents a pointer in the sparse index of the database.
 ///
@@ -335,6 +336,17 @@ impl CursorDB {
     }
 
     pub fn append(&mut self, timestamp: i64, payload: &[u8]) -> std::io::Result<()> {
+        if payload.len() > MAX_PAYLOAD_SIZE {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "Payload size {} exceeds the maximum allowed ({} bytes)",
+                    payload.len(),
+                    MAX_PAYLOAD_SIZE
+                ),
+            ));
+        }
+
         let offset = self.data_file.seek(SeekFrom::End(0))?;
 
         let mut hasher: Hasher = Hasher::new();
@@ -392,6 +404,15 @@ impl CursorDB {
         let timestamp = i64::from_le_bytes(header_buf[0..8].try_into().unwrap());
         let size = u32::from_le_bytes(header_buf[8..12].try_into().unwrap()) as usize;
         let stored_checksum = u32::from_le_bytes(header_buf[12..16].try_into().unwrap());
+
+        let file_len: u64 = self.data_file.metadata().ok()?.len();
+        if size > MAX_PAYLOAD_SIZE || (offset + 16 + size as u64) > file_len {
+            eprintln!(
+                "ERROR: Registro en offset {} excede límites de tamaño o está truncado.",
+                offset
+            );
+            return None;
+        }
 
         // 3. Leer el Payload
         let mut payload = vec![0u8; size];
