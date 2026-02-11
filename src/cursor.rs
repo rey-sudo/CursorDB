@@ -12,18 +12,31 @@ pub struct IndexEntry {
 }
 
 pub struct CursorDB {
-    pub data_file: File,
-    pub index_file: File,
-    pub index: Vec<IndexEntry>,
+    data_file: File,
+    index_file: File,
+    index: Vec<IndexEntry>,
 
-    // Cursor state (determinista)
-    pub current_row: u64,
-    pub current_offset: u64,
+    current_row: u64,
+    current_offset: u64,
 
-    pub total_rows: u64,
+    total_rows: u64,
 }
 
 impl CursorDB {
+    pub fn current_row(&self) -> u64 {
+        self.current_row
+    }
+    pub fn total_rows(&self) -> u64 {
+        self.total_rows
+    }
+    pub fn index_len(&self) -> usize {
+        self.index.len()
+    }
+    
+    pub fn current_offset(&self) -> u64 {
+        self.current_offset
+    }
+
     pub fn open_or_create(data_path: &str, index_path: &str) -> std::io::Result<Self> {
         let data_file = OpenOptions::new()
             .create(true)
