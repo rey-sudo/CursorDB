@@ -5,10 +5,28 @@ use std::io::{Read, Seek, SeekFrom, Write};
 
 const INDEX_STRIDE: u64 = 1024;
 
+/// Represents a pointer in the sparse index of the database.
+///
+/// Instead of mapping every single record, the sparse index stores "navigational markers"
+/// at fixed intervals. This allows the engine to use binary search to jump to a
+/// specific neighborhood in the file, significantly reducing linear scan time.
 #[derive(Debug, Clone)]
 pub struct IndexEntry {
+    /// The logical zero-based sequence number of the record.
+    ///
+    /// Used for row-based navigation and range queries. This acts as a
+    /// stable identifier for the record within the append-only stream.
     pub row_number: u64,
+    /// High-precision Unix timestamp (Microseconds).
+    ///
+    /// Facilitates time-series queries and chronological sorting. Using an `i64`
+    /// ensures compatibility with standard time libraries and allows for
+    /// signed duration arithmetic.
     pub timestamp: i64,
+    /// The physical starting position (in bytes) of the record within the data file.
+    ///
+    /// This offset is used by the disk controller to perform a `seek` operation
+    /// directly to the record's header before reading the payload.
     pub file_offset: u64,
 }
 
@@ -325,7 +343,7 @@ impl CursorDB {
             self.index_file.flush()?;
             self.index.push(entry);
         }
-        
+
         self.last_valid_offset = self.data_file.seek(SeekFrom::Current(0))?;
         self.total_rows += 1;
         Ok(())
