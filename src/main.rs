@@ -1,5 +1,5 @@
 use cursor_db::cursor::CursorDB;
-
+use cursor_db::record::Record;
 fn main() -> std::io::Result<()> {
     let mut db: CursorDB = CursorDB::open_or_create("data/data.bin", "data/index.bin")?;
 
@@ -46,10 +46,30 @@ fn main() -> std::io::Result<()> {
         None => println!("La base de datos está vacía."),
     }
 
-    let logs = db.range_around_cursor(10, 10);
+    let logs: Vec<Record> = db.range_around_cursor(10, 10);
     match logs.len() {
         0 => println!("No se encontraron registros en el rango especificado."),
         n => println!("Ventana de {} registros obtenida.", n),
+    }
+
+    match db.move_cursor_at(0) {
+        Some(r) => println!("Encontrado: {}", r.timestamp),
+        None => println!("Timestamp fuera de rango"),
+    }
+
+    let mut count: i32 = 0;
+    while count < 5000 {
+        match db.next() {
+            Some(record) => match db.current() {
+                Some(rec) => println!("Registro actual: {:?}", rec.timestamp),
+                None => println!("La base de datos está vacía."),
+            },
+            None => {
+                println!("Llegamos al final");
+                break;
+            }
+        }
+        count += 1;
     }
 
     Ok(())
