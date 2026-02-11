@@ -30,15 +30,33 @@ pub struct IndexEntry {
     pub file_offset: u64,
 }
 
+/// The core engine of the database, managing a seekable cursor over an append-only data stream.
+///
+/// It coordinates a primary data file and a sparse index to allow efficient
+/// O(1) writes and fast O(log n) searches via binary search.
 pub struct CursorDB {
+    /// The primary handle for the binary data file (.cdb).
+    /// Stores the actual record payloads and headers.
     data_file: File,
+    /// The persistent handle for the sparse index file (.cdbi).
+    /// Stores periodic snapshots of row positions to speed up cold starts.
     index_file: File,
+    /// The in-memory sparse index.
+    /// Acts as a jump-table for binary searching timestamps or row numbers
+    /// without scanning the entire file from disk.    
     index: Vec<IndexEntry>,
-
+    /// The logical position of the cursor (0-based row index).
+    /// Represents the ID of the record currently "under" the cursor.
     current_row: u64,
+    /// The physical byte offset of the current_row within the data_file.
+    /// Synchronized with current_row to ensure immediate access to data.    
     current_offset: u64,
-
+    /// The total count of records successfully identified in the database.
+    /// This is the source of truth for bounds checking during iteration.
     total_rows: u64,
+    /// The "high-water mark" of the database.
+    /// Points to the exact byte where the last valid record ends.
+    /// Used by health checks (stats) to detect orphan data or corruption.
     last_valid_offset: u64,
 }
 
@@ -516,6 +534,94 @@ mod tests {
     use super::*;
     use std::fs;
     use std::io::Write;
+
+    #[test]
+    fn test_cursordb_integrity_and_offsets() -> std::io::Result<()> {
+        let data_path: &str = "test_data.cdb";
+        let index_path: &str = "test_data.cdbi";
+
+        // Limpieza inicial
+        let _ = fs::remove_file(data_path);
+        let _ = fs::remove_file(index_path);
+
+        {
+            let mut db = CursorDB::open_or_create(data_path, index_path)?;
+
+            // 1. Probar Propiedad: Estado inicial vacío
+            assert_eq!(db.total_rows(), 0, "DB should start with 0 rows");
+            assert_eq!(db.current_offset(), 0, "Initial offset should be 0");
+            assert_eq!(
+                db.stats()?.orphan_data_ratio,
+                0.0,
+                "New DB should have 0% orphan data"
+            );
+
+            // 2. Probar Propiedad: Escritura y last_valid_offset
+            let payload: &[u8; 11] = b"Hello Rust!";
+            db.append(1000, payload)?; // Row 0
+
+            let expected_size: u64 = 8 + 4 + payload.len() as u64; // Header(12) + Data(11) = 23 bytes
+            assert_eq!(db.total_rows(), 1);
+
+            // Verificamos que last_valid_offset es exactamente el final del registro
+            let stats: DBStats = db.stats()?;
+            assert_eq!(stats.data_file_size_bytes, expected_size);
+            assert_eq!(
+                db.last_valid_offset, expected_size,
+                "last_valid_offset must match file size after clean append"
+            );
+            assert_eq!(
+                stats.orphan_data_ratio, 0.0,
+                "Orphan ratio should be 0.0 after successful append"
+            );
+        }
+
+        // 3. Probar Propiedad: Reconciliación y Persistencia
+        {
+            // Reabrimos la DB para ver si carga correctamente los valores
+            let db: CursorDB = CursorDB::open_or_create(data_path, index_path)?;
+            assert_eq!(
+                db.total_rows(),
+                1,
+                "Should recover total_rows from disk/index"
+            );
+            assert_eq!(
+                db.last_valid_offset, 23,
+                "Should reconstruct last_valid_offset during reconcile"
+            );
+        }
+
+        // 4. Probar Propiedad: Detección de datos huérfanos (Determinismo)
+        {
+            // Simulamos corrupción: añadimos "basura" al final del archivo manualmente
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new().append(true).open(data_path)?;
+            f.write_all(b"garbage")?; // 7 bytes de basura
+
+            let db = CursorDB::open_or_create(data_path, index_path)?;
+            let stats = db.stats()?;
+
+            // El total_rows debe seguir siendo 1 porque "garbage" no es un registro válido
+            assert_eq!(
+                db.total_rows(),
+                1,
+                "Reconcile should ignore incomplete records"
+            );
+            assert!(
+                stats.orphan_data_ratio > 0.0,
+                "Orphan data ratio should now be positive"
+            );
+            assert_eq!(
+                db.last_valid_offset, 23,
+                "last_valid_offset should stay at the last valid record boundary"
+            );
+        }
+
+        // Limpieza final
+        let _ = fs::remove_file(data_path);
+        let _ = fs::remove_file(index_path);
+        Ok(())
+    }
 
     #[test]
     fn test_open_or_create_persistence_and_recovery() -> std::io::Result<()> {
