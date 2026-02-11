@@ -1,8 +1,8 @@
-use std::thread;
-use std::time::Duration;
 use cursor_db::cursor::CursorDB;
 use cursor_db::cursor::DBStats;
 use cursor_db::record::Record;
+use std::thread;
+use std::time::Duration;
 fn main() -> std::io::Result<()> {
     let mut db: CursorDB = CursorDB::open_or_create("data/data.cdb", "data/index.cdbi")?;
 

@@ -1,4 +1,5 @@
 use crate::record::Record;
+use crc32fast::Hasher;
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -336,10 +337,15 @@ impl CursorDB {
     pub fn append(&mut self, timestamp: i64, payload: &[u8]) -> std::io::Result<()> {
         let offset = self.data_file.seek(SeekFrom::End(0))?;
 
+        let mut hasher: Hasher = Hasher::new();
+        hasher.update(payload);
+        let checksum: u32 = hasher.finalize();
+
         // Escribir datos
         self.data_file.write_all(&timestamp.to_le_bytes())?;
         let size = payload.len() as u32;
         self.data_file.write_all(&size.to_le_bytes())?;
+        self.data_file.write_all(&checksum.to_le_bytes())?;
         self.data_file.write_all(payload)?;
 
         if self.total_rows % INDEX_STRIDE == 0 {
@@ -374,25 +380,37 @@ impl CursorDB {
     }
 
     fn read_record_at(&mut self, offset: u64) -> Option<(Record, u64)> {
-        // Forzamos al archivo a ir a la posición que dicta nuestro estado lógico
+        // 1. Posicionarnos en el inicio del registro
         self.data_file.seek(SeekFrom::Start(offset)).ok()?;
 
-        let mut ts_buf = [0u8; 8];
-        let mut size_buf = [0u8; 4];
-
-        // Si no hay suficientes bytes para las cabeceras, es EOF o corrupción
-        self.data_file.read_exact(&mut ts_buf).ok()?;
-        self.data_file.read_exact(&mut size_buf).ok()?;
-
-        let timestamp = i64::from_le_bytes(ts_buf);
-        let size = u32::from_le_bytes(size_buf) as usize;
-
-        let mut payload = vec![0u8; size];
-        if self.data_file.read_exact(&mut payload).is_err() {
-            return None; // Payload incompleto
+        // 2. Leer el Header completo (16 bytes: 8 ts + 4 size + 4 crc)
+        let mut header_buf = [0u8; 16];
+        if self.data_file.read_exact(&mut header_buf).is_err() {
+            return None; // No hay suficientes bytes para un header completo
         }
 
-        let next_offset = offset + 8 + 4 + size as u64;
+        let timestamp = i64::from_le_bytes(header_buf[0..8].try_into().unwrap());
+        let size = u32::from_le_bytes(header_buf[8..12].try_into().unwrap()) as usize;
+        let stored_checksum = u32::from_le_bytes(header_buf[12..16].try_into().unwrap());
+
+        // 3. Leer el Payload
+        let mut payload = vec![0u8; size];
+        if self.data_file.read_exact(&mut payload).is_err() {
+            return None; // Payload incompleto o archivo truncado
+        }
+
+        // 4. VALIDACIÓN DE INTEGRIDAD (CRC32)
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(&payload);
+        let computed_checksum = hasher.finalize();
+
+        if computed_checksum != stored_checksum {
+            // Corrupción de datos detectada: el contenido no coincide con su firma
+            return None;
+        }
+
+        // 5. Calcular el siguiente offset: Header (16) + Payload (size)
+        let next_offset = offset + 16 + size as u64;
 
         Some((Record { timestamp, payload }, next_offset))
     }
