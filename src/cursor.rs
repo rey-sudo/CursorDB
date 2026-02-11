@@ -22,6 +22,14 @@ pub struct CursorDB {
     total_rows: u64,
 }
 
+#[derive(Debug)]
+pub struct DBStats {
+    pub total_records: u64,
+    pub data_file_size_bytes: u64,
+    pub index_entries: usize,
+    pub index_ram_usage_bytes: usize,
+    pub average_record_size: u64,
+}
 impl CursorDB {
     pub fn current_row(&self) -> u64 {
         self.current_row
@@ -32,11 +40,28 @@ impl CursorDB {
     pub fn index_len(&self) -> usize {
         self.index.len()
     }
-    
+
     pub fn current_offset(&self) -> u64 {
         self.current_offset
     }
 
+    pub fn stats(&self) -> std::io::Result<DBStats> {
+        let data_len: u64 = self.data_file.metadata()?.len();
+
+        let index_ram_usage: usize = self.index.capacity() * std::mem::size_of::<IndexEntry>();
+
+        Ok(DBStats {
+            total_records: self.total_rows,
+            data_file_size_bytes: data_len,
+            index_entries: self.index.len(),
+            index_ram_usage_bytes: index_ram_usage,
+            average_record_size: if self.total_rows > 0 {
+                data_len / self.total_rows
+            } else {
+                0
+            },
+        })
+    }
     pub fn open_or_create(data_path: &str, index_path: &str) -> std::io::Result<Self> {
         let data_file = OpenOptions::new()
             .create(true)
