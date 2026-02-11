@@ -100,7 +100,7 @@ impl fmt::Display for DBStats {
                 self.orphan_data_ratio
             )?;
         } else {
-            writeln!(f, "✅ Index is synchronized")?;
+            writeln!(f, "✔ Index is synchronized")?;
         }
 
         Ok(())
