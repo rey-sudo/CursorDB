@@ -1,7 +1,7 @@
 use cursor_db::cursor::CursorDB;
 use cursor_db::record::Record;
 fn main() -> std::io::Result<()> {
-    let mut db: CursorDB = CursorDB::open_or_create("data/data.bin", "data/index.bin")?;
+    let mut db: CursorDB = CursorDB::open_or_create("data/data.cdb", "data/index.cdbi")?;
 
     /*
         for i in 0..1_000_000 {
