@@ -50,7 +50,7 @@ impl CursorDB {
             .write(true)
             .open(index_path)?;
 
-        let mut db = Self {
+        let mut db: CursorDB = Self {
             data_file,
             index_file,
             index: Vec::new(),

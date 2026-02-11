@@ -1,16 +1,25 @@
 use cursor_db::cursor::CursorDB;
-use cursor_db::record::Record;
 
 fn main() -> std::io::Result<()> {
     let mut db: CursorDB = CursorDB::open_or_create("data/data.bin", "data/index.bin")?;
 
     /*
         for i in 0..1_000_000 {
-            let timestamp = 1_700_000_000 + i;
+            let timestamp = 1_000_000_000 + i;
             let payload = format!("payload-{}", i).into_bytes();
             db.append(timestamp, &payload)?;
         }
     */
+
+    match db.move_cursor_at(0) {
+        Some(r) => println!("Encontrado: {}", r.timestamp),
+        None => println!("Timestamp fuera de rango"),
+    }
+
+    match db.back() {
+        Some(r) => println!("Anterior: {}", r.timestamp),
+        None => println!("Ya estás en el inicio."),
+    }
 
     match db.current() {
         Some(rec) => println!("Registro actual: {:?}", rec.timestamp),
@@ -27,7 +36,7 @@ fn main() -> std::io::Result<()> {
         None => println!("Ya estás en el inicio."),
     }
 
-    match db.move_cursor_at(1700999999) {
+    match db.move_cursor_at(1000999999) {
         Some(r) => println!("Encontrado: {}", r.timestamp),
         None => println!("Timestamp fuera de rango"),
     }
