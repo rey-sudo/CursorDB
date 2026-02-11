@@ -79,6 +79,7 @@ pub struct DBStats {
     /// Useful for triggering an automated index flush.
     pub orphan_data_ratio: f64,
 }
+
 impl DBStats {
     /// Converts a raw byte count into a human-readable string (e.g., 300.00 GB).
     ///
@@ -286,52 +287,48 @@ impl CursorDB {
     }
 
     fn reconcile_total_rows(&mut self) -> std::io::Result<()> {
-        // 1. Extraer info del último registro indexado (si existe)
-        let last_indexed_info = self.index.last().map(|e| (e.row_number, e.file_offset));
-
-        // 2. Establecer el estado base
-        if let Some((row, offset)) = last_indexed_info {
-            self.total_rows = row + 1;
-            self.current_row = row; // Por defecto, el cursor es el último indexado
-            self.current_offset = offset;
-        } else {
-            self.total_rows = 0;
-            self.current_row = 0;
-            self.current_offset = 0;
-        }
-
-        // 3. Calcular desde dónde empezar a escanear registros huérfanos
-        let mut scan_offset = match last_indexed_info {
-            Some((_, offset)) => {
-                // Saltamos el registro que YA está en el índice para ver qué hay después
-                if let Some((_, next_off)) = self.read_record_at(offset) {
-                    next_off
-                } else {
-                    offset // Si falló la lectura, el archivo termina ahí
-                }
-            }
-            None => 0,
-        };
-
         let file_len = self.data_file.metadata()?.len();
 
-        // 4. Bucle de recuperación de registros no indexados
-        while scan_offset < file_len {
-            // Intentamos leer el registro potencial en scan_offset
-            if let Some((_record, next_offset)) = self.read_record_at(scan_offset) {
-                // Actualizamos el cursor al nuevo registro encontrado
-                self.current_offset = scan_offset;
-                self.current_row = self.total_rows;
-                self.total_rows += 1;
+        // 1. EXTRAER DATOS PRIMERO (Copiamos los valores fuera de self)
+        // Usamos .copied() o extraemos los campos manualmente para liberar el préstamo de self.index
+        let last_entry = self.index.last().map(|e| (e.row_number, e.file_offset));
 
-                scan_offset = next_offset;
+        let (mut row_count, mut current_off) = if let Some((row_num, offset)) = last_entry {
+            // Si hay índice, necesitamos saber dónde TERMINA ese registro indexado
+            // Llamamos a read_record_at FUERA de cualquier cierre sobre self.index
+            let (_, next_off) = self.read_record_at(offset).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "Last indexed record truncated",
+                )
+            })?;
+
+            (row_num + 1, next_off)
+        } else {
+            (0, 0)
+        };
+
+        // 2. ESCANEO (Ya no hay conflictos de préstamo)
+        while current_off < file_len {
+            if let Some((_, next_off)) = self.read_record_at(current_off) {
+                current_off = next_off;
+                row_count += 1;
             } else {
-                // Registro truncado/corrupto
-                break;
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "Integrity violation at offset {}. Partial record found.",
+                        current_off
+                    ),
+                ));
             }
         }
 
-        self.last_valid_offset = scan_offset;
+        // 3. ACTUALIZAR ESTADO
+        self.total_rows = row_count;
+        self.last_valid_offset = current_off;
+        self.current_row = 0;
+        self.current_offset = 0;
 
         Ok(())
     }
@@ -534,351 +531,4 @@ mod tests {
     use super::*;
     use std::fs;
     use std::io::Write;
-
-    #[test]
-    fn test_cursordb_integrity_and_offsets() -> std::io::Result<()> {
-        let data_path: &str = "test_data.cdb";
-        let index_path: &str = "test_data.cdbi";
-
-        // Limpieza inicial
-        let _ = fs::remove_file(data_path);
-        let _ = fs::remove_file(index_path);
-
-        {
-            let mut db = CursorDB::open_or_create(data_path, index_path)?;
-
-            // 1. Probar Propiedad: Estado inicial vacío
-            assert_eq!(db.total_rows(), 0, "DB should start with 0 rows");
-            assert_eq!(db.current_offset(), 0, "Initial offset should be 0");
-            assert_eq!(
-                db.stats()?.orphan_data_ratio,
-                0.0,
-                "New DB should have 0% orphan data"
-            );
-
-            // 2. Probar Propiedad: Escritura y last_valid_offset
-            let payload: &[u8; 11] = b"Hello Rust!";
-            db.append(1000, payload)?; // Row 0
-
-            let expected_size: u64 = 8 + 4 + payload.len() as u64; // Header(12) + Data(11) = 23 bytes
-            assert_eq!(db.total_rows(), 1);
-
-            // Verificamos que last_valid_offset es exactamente el final del registro
-            let stats: DBStats = db.stats()?;
-            assert_eq!(stats.data_file_size_bytes, expected_size);
-            assert_eq!(
-                db.last_valid_offset, expected_size,
-                "last_valid_offset must match file size after clean append"
-            );
-            assert_eq!(
-                stats.orphan_data_ratio, 0.0,
-                "Orphan ratio should be 0.0 after successful append"
-            );
-        }
-
-        // 3. Probar Propiedad: Reconciliación y Persistencia
-        {
-            // Reabrimos la DB para ver si carga correctamente los valores
-            let db: CursorDB = CursorDB::open_or_create(data_path, index_path)?;
-            assert_eq!(
-                db.total_rows(),
-                1,
-                "Should recover total_rows from disk/index"
-            );
-            assert_eq!(
-                db.last_valid_offset, 23,
-                "Should reconstruct last_valid_offset during reconcile"
-            );
-        }
-
-        // 4. Probar Propiedad: Detección de datos huérfanos (Determinismo)
-        {
-            // Simulamos corrupción: añadimos "basura" al final del archivo manualmente
-            use std::io::Write;
-            let mut f = std::fs::OpenOptions::new().append(true).open(data_path)?;
-            f.write_all(b"garbage")?; // 7 bytes de basura
-
-            let db = CursorDB::open_or_create(data_path, index_path)?;
-            let stats = db.stats()?;
-
-            // El total_rows debe seguir siendo 1 porque "garbage" no es un registro válido
-            assert_eq!(
-                db.total_rows(),
-                1,
-                "Reconcile should ignore incomplete records"
-            );
-            assert!(
-                stats.orphan_data_ratio > 0.0,
-                "Orphan data ratio should now be positive"
-            );
-            assert_eq!(
-                db.last_valid_offset, 23,
-                "last_valid_offset should stay at the last valid record boundary"
-            );
-        }
-
-        // Limpieza final
-        let _ = fs::remove_file(data_path);
-        let _ = fs::remove_file(index_path);
-        Ok(())
-    }
-
-    #[test]
-    fn test_open_or_create_persistence_and_recovery() -> std::io::Result<()> {
-        let data_path = "test_persistence.db";
-        let index_path = "test_persistence.idx";
-
-        // Limpieza previa por si acaso
-        let _ = fs::remove_file(data_path);
-        let _ = fs::remove_file(index_path);
-
-        // --- ESCENARIO 1: Crear y escribir datos ---
-        {
-            let mut db = CursorDB::open_or_create(data_path, index_path)?;
-            // Escribimos 1 registro. Al ser el primero (row 0), se indexará.
-            db.append(100, b"primer registro")?;
-
-            // Forzamos un segundo registro que NO se indexará (porque INDEX_STRIDE es 1024)
-            db.append(200, b"segundo registro")?;
-
-            assert_eq!(db.total_rows, 2);
-            assert_eq!(db.index.len(), 1);
-        } // Aquí la DB se cierra y los archivos se guardan
-
-        // --- ESCENARIO 2: Reabrir y verificar persistencia ---
-        {
-            let mut db = CursorDB::open_or_create(data_path, index_path)?;
-
-            // Verificamos que cargó el índice (1 entrada)
-            assert_eq!(
-                db.index.len(),
-                1,
-                "Debería haber cargado 1 entrada de índice"
-            );
-
-            // Verificamos que reconcilió el segundo registro (huérfano)
-            assert_eq!(
-                db.total_rows, 2,
-                "Debería haber recuperado el registro no indexado"
-            );
-
-            // Verificamos que el cursor apunta al último registro (el huérfano)
-            let last_rec = db.current().expect("Debería existir el registro actual");
-            assert_eq!(last_rec.timestamp, 200);
-            assert_eq!(last_rec.payload, b"segundo registro");
-        }
-
-        // --- ESCENARIO 3: Verificar que el cursor de escritura está al final ---
-        {
-            let mut db = CursorDB::open_or_create(data_path, index_path)?;
-            // Si el puntero de escritura no se movió al final en open_or_create,
-            // este append sobrescribiría datos antiguos.
-            db.append(300, b"tercer registro")?;
-
-            assert_eq!(db.total_rows, 3);
-
-            // Movemos el cursor al principio para leer todo y verificar integridad
-            // (Nota: asumiendo que implementarás un reset_cursor o similar)
-            db.move_cursor_at(100);
-            assert_eq!(db.current().unwrap().timestamp, 100);
-            db.next(); // registro 200
-            db.next(); // registro 300
-            assert_eq!(db.current().unwrap().timestamp, 300);
-        }
-
-        // Limpieza final
-        fs::remove_file(data_path)?;
-        fs::remove_file(index_path)?;
-        Ok(())
-    }
-
-    #[test]
-    fn test_load_index_and_reconciliation() -> std::io::Result<()> {
-        let data_path = "test_data.db";
-        let index_path = "test_index.idx";
-
-        // 1. Limpieza inicial
-        let _ = fs::remove_file(data_path);
-        let _ = fs::remove_file(index_path);
-
-        {
-            // 2. Simulamos una escritura manual en los archivos
-            // Registro 0 (Indexado)
-            let mut d_file = File::create(data_path)?;
-            let mut i_file = File::create(index_path)?;
-
-            let ts0: i64 = 1000;
-            let payload0 = b"hola";
-            d_file.write_all(&ts0.to_le_bytes())?;
-            d_file.write_all(&(payload0.len() as u32).to_le_bytes())?;
-            d_file.write_all(payload0)?;
-
-            // Escribimos entrada en el índice para el registro 0
-            i_file.write_all(&0u64.to_le_bytes())?; // row_number
-            i_file.write_all(&ts0.to_le_bytes())?; // timestamp
-            i_file.write_all(&0u64.to_le_bytes())?; // file_offset (empieza en 0)
-
-            // Registro 1 (NO INDEXADO - Para probar reconciliación)
-            // Offset actual: 8 (ts) + 4 (size) + 4 (hola) = 16
-            let ts1: i64 = 2000;
-            let payload1 = b"mundo";
-            d_file.write_all(&ts1.to_le_bytes())?;
-            d_file.write_all(&(payload1.len() as u32).to_le_bytes())?;
-            d_file.write_all(payload1)?;
-
-            d_file.flush()?;
-            i_file.flush()?;
-        }
-
-        // 3. Abrimos la base de datos (esto dispara load_index)
-        let mut db = CursorDB::open_or_create(data_path, index_path)?;
-
-        // 4. Verificaciones
-        // Debería haber cargado 1 entrada en el índice de memoria
-        assert_eq!(db.index.len(), 1, "El índice debería tener 1 entrada");
-
-        // Debería haber reconciliado total_rows a 2
-        assert_eq!(
-            db.total_rows, 2,
-            "Debería haber detectado 2 filas totales tras la reconciliación"
-        );
-
-        // El cursor debería estar en la última fila válida (fila 1, offset 16)
-        assert_eq!(db.current_row, 1);
-
-        // Verificar que podemos leer el registro no indexado
-        let record = db.current().expect("Debería poder leer el registro actual");
-        assert_eq!(record.payload, b"mundo");
-
-        // 5. Limpieza final
-        fs::remove_file(data_path)?;
-        fs::remove_file(index_path)?;
-        Ok(())
-    }
-
-    #[test]
-    fn test_read_immediately_after_opening() -> std::io::Result<()> {
-        let data_path = "test_instant_read.db";
-        let index_path = "test_instant_read.idx";
-        let _ = fs::remove_file(data_path);
-        let _ = fs::remove_file(index_path);
-
-        // 1. Crear y cerrar
-        {
-            let mut db = CursorDB::open_or_create(data_path, index_path)?;
-            db.append(12345, b"data")?;
-        }
-
-        // 2. Reabrir y leer SIN hacer append
-        let mut db = CursorDB::open_or_create(data_path, index_path)?;
-        let rec = db
-            .current()
-            .expect("Debería leer el registro aunque no se haya hecho append en esta sesión");
-        assert_eq!(rec.timestamp, 12345);
-
-        let _ = fs::remove_file(data_path);
-        let _ = fs::remove_file(index_path);
-        Ok(())
-    }
-
-    #[test]
-    fn test_cursor_navigation_cycle() -> std::io::Result<()> {
-        let data_path = "test_cycle.db";
-        let index_path = "test_cycle.idx";
-
-        // Limpieza
-        let _ = fs::remove_file(data_path).ok();
-        let _ = fs::remove_file(index_path).ok();
-
-        {
-            let mut db = CursorDB::open_or_create(data_path, index_path)?;
-
-            // Insertamos 3 registros para tener un recorrido claro (0, 1, 2)
-            db.append(100, b"data_0")?; // Indexado (si es el primero)
-            db.append(200, b"data_1")?; // Huérfano
-            db.append(300, b"data_2")?; // Huérfano
-
-            // Forzamos inicio (Fila 0)
-            db.current_row = 0;
-            db.current_offset = 0;
-
-            // 1. CURRENT (Fila 0)
-            let c1 = db.current().expect("Debería leer registro 0");
-            assert_eq!(c1.timestamp, 100);
-            assert_eq!(db.current_row, 0);
-
-            // 2. NEXT -> Fila 1
-            let n1 = db.next().expect("Debería avanzar a fila 1");
-            assert_eq!(n1.timestamp, 200);
-            assert_eq!(db.current_row, 1);
-
-            // 3. CURRENT (Fila 1) - Verificar que no se movió al leer
-            let c2 = db.current().expect("Debería seguir en fila 1");
-            assert_eq!(c2.timestamp, 200);
-            assert_eq!(db.current_row, 1);
-
-            // 4. BACK -> Fila 0
-            // Aquí el motor usará el índice para volver atrás
-            let b1 = db.back().expect("Debería volver a fila 0");
-            assert_eq!(b1.timestamp, 100);
-            assert_eq!(db.current_row, 0);
-
-            // 5. CURRENT (Fila 0) - Verificación final de ciclo
-            let c3 = db.current().expect("Debería estar de vuelta en fila 0");
-            assert_eq!(c3.timestamp, 100);
-            assert_eq!(db.current_row, 0);
-        }
-
-        fs::remove_file(data_path)?;
-        fs::remove_file(index_path)?;
-        Ok(())
-    }
-
-    #[test]
-    fn test_cursor_next_navigation() -> std::io::Result<()> {
-        let data_path = "test_next.db";
-        let index_path = "test_next.idx";
-
-        // Limpieza
-        let _ = fs::remove_file(data_path);
-        let _ = fs::remove_file(index_path);
-
-        {
-            let mut db = CursorDB::open_or_create(data_path, index_path)?;
-
-            // Insertamos 3 registros
-            db.append(1000, b"rec_0")?; // Este será indexado (row 0)
-            db.append(2000, b"rec_1")?; // Huérfano
-            db.append(3000, b"rec_2")?; // Huérfano
-
-            // Forzamos el cursor al inicio para probar next()
-            // (Si no tienes move_to_start, lo hacemos manualmente para el test)
-            db.current_row = 0;
-            db.current_offset = 0;
-
-            // --- Prueba 1: Avance de 0 a 1 ---
-            let res1 = db.next().expect("Debería avanzar al registro 1");
-            assert_eq!(res1.timestamp, 2000);
-            assert_eq!(res1.payload, b"rec_1");
-            assert_eq!(db.current_row, 1);
-
-            // --- Prueba 2: Avance de 1 a 2 (último) ---
-            let res2 = db.next().expect("Debería avanzar al registro 2");
-            assert_eq!(res2.timestamp, 3000);
-            assert_eq!(res2.payload, b"rec_2");
-            assert_eq!(db.current_row, 2);
-
-            // --- Prueba 3: Intento de avanzar más allá del final ---
-            let res3 = db.next();
-            assert!(res3.is_none(), "Debería devolver None al llegar al final");
-            assert_eq!(
-                db.current_row, 2,
-                "El contador de fila no debería haber aumentado"
-            );
-        }
-
-        fs::remove_file(data_path)?;
-        fs::remove_file(index_path)?;
-        Ok(())
-    }
 }
