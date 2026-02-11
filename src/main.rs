@@ -1,3 +1,5 @@
+use std::thread;
+use std::time::Duration;
 use cursor_db::cursor::CursorDB;
 use cursor_db::cursor::DBStats;
 use cursor_db::record::Record;
@@ -11,6 +13,8 @@ fn main() -> std::io::Result<()> {
             db.append(timestamp, &payload)?;
         }
     */
+
+    thread::sleep(Duration::from_millis(500));
 
     let stats: DBStats = db.stats()?;
     println!("{}", stats);

@@ -21,6 +21,7 @@ pub struct CursorDB {
     current_offset: u64,
 
     total_rows: u64,
+    last_valid_offset: u64,
 }
 
 #[derive(Debug)]
@@ -92,14 +93,14 @@ impl fmt::Display for DBStats {
         )?;
         writeln!(f, "{}", "━".repeat(35))?;
 
-        if self.orphan_data_ratio > 0.1 {
+        if self.orphan_data_ratio > 0.0 {
             writeln!(
                 f,
-                "⚠️  Warning: {:.1}% of data is unindexed",
+                "⚠️  Warning: {:.5}% of data is unindexed",
                 self.orphan_data_ratio
             )?;
         } else {
-            writeln!(f, "✓ Index is synchronized")?;
+            writeln!(f, "✅ Index is synchronized")?;
         }
 
         Ok(())
@@ -124,23 +125,26 @@ impl CursorDB {
         self.current_offset
     }
     /// Generates a snapshot of the database health and storage metrics.
-    /// Performs an O(1) operation by querying file metadata and internal counters.
     pub fn stats(&self) -> std::io::Result<DBStats> {
         let data_len: u64 = self.data_file.metadata()?.len();
         let index_len: usize = self.index.len();
 
-        // Calculate the last indexed physical position
         let last_indexed_offset: u64 = self
             .index
             .last()
             .map(|e: &IndexEntry| e.file_offset)
             .unwrap_or(0);
 
-        // Orphan ratio: How much data exists beyond the current cursor
-        let orphan_bytes: u64 = if data_len > self.current_offset {
-            data_len - self.current_offset
+        let orphan_bytes: u64 = if data_len > self.last_valid_offset {
+            data_len - self.last_valid_offset
         } else {
             0
+        };
+
+        let orphan_ratio: f64 = if data_len > 0 {
+            (orphan_bytes as f64 / data_len as f64) * 100.0
+        } else {
+            0.0
         };
 
         Ok(DBStats {
@@ -153,20 +157,13 @@ impl CursorDB {
             } else {
                 0
             },
-
-            // Deterministic distance between index markers
             index_interval_bytes: if index_len > 1 {
                 last_indexed_offset / (index_len as u64)
             } else {
                 0
             },
 
-            // Percentage of data "in the dark" (appended but not yet indexed)
-            orphan_data_ratio: if data_len > 0 {
-                (orphan_bytes as f64 / data_len as f64) * 100.0
-            } else {
-                0.0
-            },
+            orphan_data_ratio: orphan_ratio,
         })
     }
 
@@ -208,6 +205,7 @@ impl CursorDB {
             current_row: 0,
             current_offset: 0,
             total_rows: 0,
+            last_valid_offset: 0,
         };
 
         db.load_index()?;
@@ -297,6 +295,8 @@ impl CursorDB {
             }
         }
 
+        self.last_valid_offset = scan_offset;
+
         Ok(())
     }
 
@@ -325,7 +325,8 @@ impl CursorDB {
             self.index_file.flush()?;
             self.index.push(entry);
         }
-
+        
+        self.last_valid_offset = self.data_file.seek(SeekFrom::Current(0))?;
         self.total_rows += 1;
         Ok(())
     }
