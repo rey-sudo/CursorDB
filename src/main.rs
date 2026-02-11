@@ -4,33 +4,44 @@ use cursor_db::record::Record;
 fn main() -> std::io::Result<()> {
     let mut db: CursorDB = CursorDB::open_or_create("data/data.bin", "data/index.bin")?;
 
-    println!("Appending records...");
-    for i in 0..100 {
-        let timestamp = 1_700_000_000 + i;
-        let payload = format!("payload-{}", i).into_bytes();
-        db.append(timestamp, &payload)?;
+    /*
+        for i in 0..1_000_000 {
+            let timestamp = 1_700_000_000 + i;
+            let payload = format!("payload-{}", i).into_bytes();
+            db.append(timestamp, &payload)?;
+        }
+    */
+
+    match db.current() {
+        Some(rec) => println!("Registro actual: {:?}", rec.timestamp),
+        None => println!("La base de datos está vacía."),
     }
 
-    let cur: Record = db.current().unwrap();
-    println!("Current={}", cur.timestamp);
+    match db.next() {
+        Some(r) => println!("Siguiente: {}", r.timestamp),
+        None => println!("Fin del archivo alcanzado."),
+    }
 
-    let next: Record = db.next().unwrap();
-    println!("Next={}", next.timestamp);
+    match db.back() {
+        Some(r) => println!("Anterior: {}", r.timestamp),
+        None => println!("Ya estás en el inicio."),
+    }
 
-    let current: Record = db.current().unwrap();
-    println!("Current={}", current.timestamp);
+    match db.move_cursor_at(1700999999) {
+        Some(r) => println!("Encontrado: {}", r.timestamp),
+        None => println!("Timestamp fuera de rango"),
+    }
 
-    let back: Record = db.back().unwrap();
-    println!("Back={}", back.timestamp);
+    match db.current() {
+        Some(rec) => println!("Registro actual: {:?}", rec.timestamp),
+        None => println!("La base de datos está vacía."),
+    }
 
-    let current: Record = db.current().unwrap();
-    println!("Current={}", current.timestamp);
-
-    let moved: Record = db.move_cursor_at(1_700_000_040).unwrap();
-    println!("Moved={}", moved.timestamp);
-
-    let current: Record = db.current().unwrap();
-    println!("Current={}", current.timestamp);
+    let logs = db.range_around_cursor(10, 10);
+    match logs.len() {
+        0 => println!("No se encontraron registros en el rango especificado."),
+        n => println!("Ventana de {} registros obtenida.", n),
+    }
 
     Ok(())
 }
