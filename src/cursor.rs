@@ -169,11 +169,14 @@ impl CursorDB {
         let data_len: u64 = self.data_file.metadata()?.len();
         let index_len: usize = self.index.len();
 
-        let last_indexed_offset: u64 = self
-            .index
-            .last()
-            .map(|e: &IndexEntry| e.file_offset)
-            .unwrap_or(0);
+        let entries = self.index.len();
+
+        let index_interval_bytes = if entries == 0 {
+            0
+        } else {
+            // Aseguramos que file_size sea u64 antes de dividir
+            self.last_valid_offset / entries as u64
+        };
 
         let orphan_bytes: u64 = if data_len > self.last_valid_offset {
             data_len - self.last_valid_offset
@@ -181,7 +184,7 @@ impl CursorDB {
             0
         };
 
-        let orphan_ratio: f64 = if data_len > 0 {
+        let orphan_data_ratio: f64 = if data_len > 0 {
             (orphan_bytes as f64 / data_len as f64) * 100.0
         } else {
             0.0
@@ -197,13 +200,8 @@ impl CursorDB {
             } else {
                 0
             },
-            index_interval_bytes: if index_len > 1 {
-                last_indexed_offset / (index_len as u64)
-            } else {
-                0
-            },
-
-            orphan_data_ratio: orphan_ratio,
+            index_interval_bytes,
+            orphan_data_ratio,
         })
     }
 
@@ -366,8 +364,10 @@ impl CursorDB {
             self.index.push(entry);
         }
 
-        self.last_valid_offset = self.data_file.seek(SeekFrom::Current(0))?;
+        self.data_file.flush()?;
+
         self.total_rows += 1;
+        self.last_valid_offset = self.data_file.seek(SeekFrom::Current(0))?;
         Ok(())
     }
 
@@ -609,37 +609,443 @@ mod tests {
     use std::io::Write;
 
     #[test]
-    fn test_total_records_integrity_and_persistence() {
-        let db_path = "data/test_data.cdb";
-        let index_path = "data/test_index.cdbi";
+    fn test_total_records_integrity_and_persistence() -> std::io::Result<()> {
+        let db_path: &str = "data/test_data.cdb";
+        let index_path: &str = "data/test_index.cdbi";
 
-        // Limpieza inicial para asegurar un test limpio
+        // Initial cleaning
         let _ = std::fs::remove_file(db_path);
         let _ = std::fs::remove_file(index_path);
 
         {
-            // 1. Usamos tu método guardado en memoria
-            let mut db = CursorDB::open_or_create(db_path, index_path).unwrap();
-            db.append(1000, b"data 1").unwrap();
-            db.append(2000, b"data 2").unwrap();
+            // 1. Creación y escritura
+            // Usamos ? porque si falla la creación, el test debe fallar con el error de IO
+            let mut db: CursorDB = CursorDB::open_or_create(db_path, index_path)?;
+            db.append(1000, b"data 1")?;
+            db.append(2000, b"data 2")?;
 
-            let stats = db.stats().unwrap();
+            let stats: DBStats = db.stats()?;
             assert_eq!(stats.total_records, 2, "Debe haber 2 registros");
-        } // Flush automático al salir del scope
+        }
 
         {
-            // 2. Reapertura: Aquí es donde reconcile_total_rows hace su magia
-            let db = CursorDB::open_or_create(db_path, index_path).unwrap();
-            let stats = db.stats().unwrap();
+            // 2. Reapertura y validación de Reconciliación
+            let mut db: CursorDB = CursorDB::open_or_create(db_path, index_path)?;
+            let stats: DBStats = db.stats()?;
 
             assert_eq!(
                 stats.total_records, 2,
-                "Persistencia: Debe seguir habiendo 2 registros"
+                "Persistencia: Debe seguir habiendo 2 registros tras la reapertura"
+            );
+
+            // 3. Probando la nueva navegación con Result
+            let first: Record = db
+                .move_cursor_at(0)?
+                .expect("Debe existir el primer registro");
+            assert_eq!(first.timestamp, 1000);
+
+            let second = db.next()?.expect("Debe existir el segundo registro");
+            assert_eq!(second.timestamp, 2000);
+        }
+
+        // 4. EXTRA: TEST DE CORRUPCIÓN (La prueba de fuego para tu nuevo Result)
+        {
+            use std::io::Write;
+            // Abrimos el archivo manualmente y saboteamos un byte de los datos
+            let mut f = std::fs::OpenOptions::new().write(true).open(db_path)?;
+            f.seek(std::io::SeekFrom::Start(20))?; // Saltamos el header y tocamos el payload
+            f.write_all(b"X")?;
+
+            // Intentamos abrir la DB. reconcile_total_rows fallará porque el CRC no coincidirá
+            let result: std::result::Result<CursorDB, Error> =
+                CursorDB::open_or_create(db_path, index_path);
+
+            assert!(
+                result.is_err(),
+                "La DB NO debería abrirse si hay corrupción de CRC"
+            );
+            println!(
+                "Éxito: El sistema detectó la corrupción: {:?}",
+                result.err()
             );
         }
 
         // Limpieza final
         let _ = std::fs::remove_file(db_path);
         let _ = std::fs::remove_file(index_path);
+        Ok(())
+    }
+
+    #[test]
+    fn test_data_file_size_logic() -> std::io::Result<()> {
+        let db_path = "data/test_size.cdb";
+        let index_path = "data/test_size_index.cdbi";
+
+        // Limpieza inicial
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(index_path);
+
+        {
+            let mut db = CursorDB::open_or_create(db_path, index_path)?;
+
+            // 1. Verificar tamaño inicial (0 bytes)
+            let stats = db.stats()?;
+            assert_eq!(
+                stats.data_file_size_bytes, 0,
+                "El archivo nuevo debe pesar 0 bytes"
+            );
+
+            // 2. Escribir un registro y calcular tamaño esperado
+            // Registro = 16 bytes (Header) + 4 bytes (Payload) = 20 bytes
+            let payload = b"test";
+            db.append(123456789, payload)?;
+
+            let stats_after_one = db.stats()?;
+            let expected_size = 16 + payload.len() as u64;
+
+            assert_eq!(
+                stats_after_one.data_file_size_bytes,
+                expected_size,
+                "El tamaño debe ser Header(16) + Payload({})",
+                payload.len()
+            );
+
+            // 3. Comparar con el tamaño real del sistema de archivos
+            let actual_file_size = std::fs::metadata(db_path)?.len();
+            assert_eq!(
+                stats_after_one.data_file_size_bytes, actual_file_size,
+                "El valor de stats debe coincidir con el tamaño físico en disco"
+            );
+        }
+
+        {
+            // 4. Reapertura: Verificar que al abrir, el tamaño se mantiene
+            let mut db = CursorDB::open_or_create(db_path, index_path)?;
+            let stats_reopen = db.stats()?;
+            let actual_file_size = std::fs::metadata(db_path)?.len();
+
+            assert_eq!(
+                stats_reopen.data_file_size_bytes, actual_file_size,
+                "Tras reapertura, el tamaño detectado debe ser igual al del disco"
+            );
+
+            // 5. Verificación de crecimiento acumulado
+            let extra_payload = b"more data"; // 9 bytes
+            db.append(123456790, extra_payload)?; // +25 bytes (16 + 9)
+
+            let final_stats = db.stats()?;
+            let final_expected = (16 + 4) + (16 + 9); // 45 bytes totales
+
+            assert_eq!(final_stats.data_file_size_bytes, final_expected);
+        }
+
+        // Limpieza final
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(index_path);
+        Ok(())
+    }
+
+    #[test]
+    fn test_index_entries_counting_logic() -> std::io::Result<()> {
+        let db_path = "data/test_idx.cdb";
+        let index_path = "data/test_idx.cdbi";
+
+        // USAMOS LA CONSTANTE REAL
+        let stride = INDEX_STRIDE;
+
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(index_path);
+
+        {
+            let mut db = CursorDB::open_or_create(db_path, index_path)?;
+
+            // 1. Registro 0: Crea la entrada 1
+            db.append(1000, b"registro 0")?;
+            assert_eq!(db.stats()?.index_entries, 1);
+
+            // 2. Llenar hasta JUSTO ANTES del trigger
+            // Si stride es 1024, llenamos hasta el 1023
+            for i in 1..stride {
+                db.append(1000 + i as i64, b"data")?;
+            }
+
+            // Con 1024 registros (0 a 1023), aún solo debe haber 1 entrada
+            assert_eq!(
+                db.stats()?.index_entries,
+                1,
+                "Aún no llegamos al registro {}",
+                stride
+            );
+
+            // 3. Registro 1024: ¡TRIGGER!
+            // Aquí total_rows es 1024, por lo que 1024 % 1024 == 0
+            db.append(2000, b"registro trigger")?;
+
+            let stats = db.stats()?;
+            assert_eq!(
+                stats.index_entries, 2,
+                "El registro {} debió crear la segunda entrada",
+                stride
+            );
+        }
+
+        {
+            // 4. Verificación física (Cada entrada ocupa 24 bytes)
+            let actual_file_size = std::fs::metadata(index_path)?.len();
+            assert_eq!(actual_file_size, 2 * 24);
+        }
+
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(index_path);
+        Ok(())
+    }
+
+    #[test]
+    fn test_index_ram_usage_logic() -> std::io::Result<()> {
+        let db_path = "data/test_ram.cdb";
+        let index_path = "data/test_ram.cdbi";
+
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(index_path);
+
+        {
+            let mut db = CursorDB::open_or_create(db_path, index_path)?;
+
+            // 1. Estado inicial: El primer registro siempre se indexa
+            db.append(1000, b"data")?;
+            let stats = db.stats()?;
+
+            // Cada entrada: row(8) + ts(8) + offset(8) = 24 bytes
+            let entry_size = std::mem::size_of::<IndexEntry>();
+            assert_eq!(
+                entry_size, 24,
+                "La estructura IndexEntry debería medir 24 bytes"
+            );
+
+            // El uso de RAM debe ser al menos (entradas * 24)
+            assert!(stats.index_ram_usage_bytes >= 1 * 24);
+
+            // 2. Llenar la DB para forzar múltiples entradas
+            // Con INDEX_STRIDE = 1024, insertamos 3000 registros para tener 3 entradas (0, 1024, 2048)
+            for i in 1..3000 {
+                db.append(1000 + i as i64, b"data")?;
+            }
+
+            let stats_multi = db.stats()?;
+            let num_entries = stats_multi.index_entries as usize;
+
+            // La lógica correcta de RAM usage debería considerar la CAPACIDAD del Vec,
+            // no solo el número de elementos, para ser 100% honesta.
+            // Pero el mínimo absoluto es num_entries * 24.
+            assert_eq!(num_entries, 3, "Debería haber 3 entradas de índice");
+            assert!(stats_multi.index_ram_usage_bytes >= 3 * 24);
+
+            println!(
+                "RAM Usage reportado: {} bytes",
+                stats_multi.index_ram_usage_bytes
+            );
+        }
+
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(index_path);
+        Ok(())
+    }
+
+    #[test]
+    fn test_average_record_size_logic() -> std::io::Result<()> {
+        let db_path = "data/test_avg.cdb";
+        let index_path = "data/test_avg.cdbi";
+
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(index_path);
+
+        {
+            let mut db = CursorDB::open_or_create(db_path, index_path)?;
+
+            // 1. Caso base: Un solo registro
+            // Header (16) + Payload (4) = 20 bytes
+            let payload1 = b"1234";
+            db.append(1000, payload1)?;
+
+            let stats1 = db.stats()?;
+            assert_eq!(
+                stats1.average_record_size, 20,
+                "Con un solo registro de 20 bytes, el promedio debe ser 20"
+            );
+
+            // 2. Registros heterogéneos (mezcla de tamaños)
+            // Añadimos un registro grande: Header (16) + Payload (84) = 100 bytes
+            let payload2 = vec![0u8; 84];
+            db.append(2000, &payload2)?;
+
+            let stats2 = db.stats()?;
+            // Total bytes = 20 + 100 = 120. Total records = 2.
+            // Promedio esperado = 120 / 2 = 60
+            assert_eq!(
+                stats2.average_record_size, 60,
+                "El promedio de 20 y 100 debe ser 60"
+            );
+
+            // 3. Verificación de redondeo (División entera)
+            // Añadimos un registro de 21 bytes: Header (16) + Payload (5)
+            // Total bytes = 120 + 21 = 141. Total records = 3.
+            // 141 / 3 = 47
+            db.append(3000, b"12345")?;
+            let stats3 = db.stats()?;
+            assert_eq!(stats3.average_record_size, 47);
+        }
+
+        {
+            // 4. Persistencia: ¿Sigue siendo correcto tras reabrir?
+            let db = CursorDB::open_or_create(db_path, index_path)?;
+            let stats_reopen = db.stats()?;
+
+            assert_eq!(stats_reopen.total_records, 3);
+            assert_eq!(stats_reopen.average_record_size, 47);
+
+            // Comprobación cruzada manual
+            let manual_avg = stats_reopen.data_file_size_bytes / stats_reopen.total_records;
+            assert_eq!(stats_reopen.average_record_size, manual_avg);
+        }
+
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(index_path);
+        Ok(())
+    }
+
+    #[test]
+    fn test_index_interval_bytes_logic() -> std::io::Result<()> {
+        let db_path = "data/test_interval.cdb";
+        let index_path = "data/test_interval.cdbi";
+
+        // Limpieza inicial
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(index_path);
+
+        {
+            let mut db = CursorDB::open_or_create(db_path, index_path)?;
+
+            // 1. Caso base: Primer registro (Fila 0)
+            // Header(16 bytes) + Payload "1234"(4 bytes) = 20 bytes totales.
+            db.append(1000, b"1234")?;
+
+            let stats1 = db.stats()?;
+            println!(
+                "DEBUG 1: size={}, entries={}, interval={}",
+                stats1.data_file_size_bytes, stats1.index_entries, stats1.index_interval_bytes
+            );
+
+            assert_eq!(stats1.index_entries, 1, "Debe haber 1 entrada");
+            assert_eq!(
+                stats1.data_file_size_bytes, 20,
+                "El tamaño debe ser 20 bytes"
+            );
+            assert_eq!(
+                stats1.index_interval_bytes, 20,
+                "Intervalo inicial: 20 / 1 = 20"
+            );
+
+            // 2. Llenar registros sin disparar nuevo índice
+            // Añadimos 9 registros más del mismo tamaño (9 * 20 = 180 bytes extra)
+            // Total acumulado: 200 bytes. Entries: sigue siendo 1.
+            for i in 1..10 {
+                db.append(1000 + i, b"1234")?;
+            }
+
+            let stats2 = db.stats()?;
+            println!(
+                "DEBUG 2: size={}, entries={}, interval={}",
+                stats2.data_file_size_bytes, stats2.index_entries, stats2.index_interval_bytes
+            );
+
+            assert_eq!(stats2.index_entries, 1);
+            assert_eq!(stats2.index_interval_bytes, 200, "Intervalo: 200 / 1 = 200");
+
+            // 3. Cruzar el Stride (INDEX_STRIDE = 1024)
+            // Necesitamos llegar al registro 1024 para que se cree la segunda entrada.
+            // Ya tenemos 10 registros, faltan 1014 para llegar al 'trigger'
+            for i in 10..INDEX_STRIDE {
+                db.append(2000 + i as i64, b"1234")?;
+            }
+
+            // Este registro (el 1024) dispara la entrada 2
+            db.append(3000, b"trigger")?;
+
+            let stats3 = db.stats()?;
+            println!(
+                "DEBUG 3: size={}, entries={}, interval={}",
+                stats3.data_file_size_bytes, stats3.index_entries, stats3.index_interval_bytes
+            );
+
+            assert_eq!(
+                stats3.index_entries, 2,
+                "Debe haber 2 entradas de índice ahora"
+            );
+
+            // El intervalo debe ser (Total Bytes / 2 entradas)
+            let expected_interval = stats3.data_file_size_bytes / 2;
+            assert_eq!(
+                stats3.index_interval_bytes, expected_interval,
+                "El intervalo debe ser el tamaño total entre las 2 entradas"
+            );
+        }
+
+        // Limpieza final
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(index_path);
+        Ok(())
+    }
+
+    #[test]
+    fn test_orphan_data_ratio_percentage_logic() -> std::io::Result<()> {
+        let db_path = "data/test_orphan_ratio.cdb";
+        let index_path = "data/test_orphan_ratio.cdbi";
+
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(index_path);
+
+        // 1. Crear DB sana
+        {
+            let mut db = CursorDB::open_or_create(db_path, index_path)?;
+            db.append(1000, vec![0u8; 84].as_slice())?; // 100 bytes totales
+            assert_eq!(db.stats()?.orphan_data_ratio, 0.0);
+        }
+
+        // 2. Añadir basura (Simulamos crash)
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new().append(true).open(db_path)?;
+            f.write_all(b"basura_incompleta")?; // 17 bytes de basura
+            f.flush()?;
+        }
+
+        // 3. Verificación
+        // Si tu CursorDB es estricto, esto devolverá Err.
+        // Si quieres que stats() funcione, reconcile_total_rows debería atrapar el error
+        // y simplemente dejar de contar registros, manteniendo el last_valid_offset.
+
+        let db_res = CursorDB::open_or_create(db_path, index_path);
+
+        match db_res {
+            Ok(db) => {
+                let stats = db.stats()?;
+                assert!(stats.orphan_data_ratio > 0.0);
+            }
+            Err(e) => {
+                let error_msg = e.to_string();
+                // Verificamos que el error sea uno de los de integridad
+                assert!(
+                    error_msg.contains("supera el límite")
+                        || error_msg.contains("Header incompleto"),
+                    "El error debería ser de integridad, pero fue: {}",
+                    error_msg
+                );
+                println!("Éxito: El sistema bloqueó el archivo corrupto correctamente.");
+            }
+        }
+
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(index_path);
+        Ok(())
     }
 }
