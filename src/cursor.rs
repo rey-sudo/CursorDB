@@ -570,4 +570,39 @@ mod tests {
     use super::*;
     use std::fs;
     use std::io::Write;
+
+    #[test]
+    fn test_total_records_integrity_and_persistence() {
+        let db_path = "data/test_data.cdb";
+        let index_path = "data/test_index.cdbi";
+
+        // Limpieza inicial para asegurar un test limpio
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(index_path);
+
+        {
+            // 1. Usamos tu método guardado en memoria
+            let mut db = CursorDB::open_or_create(db_path, index_path).unwrap();
+            db.append(1000, b"data 1").unwrap();
+            db.append(2000, b"data 2").unwrap();
+
+            let stats = db.stats().unwrap();
+            assert_eq!(stats.total_records, 2, "Debe haber 2 registros");
+        } // Flush automático al salir del scope
+
+        {
+            // 2. Reapertura: Aquí es donde reconcile_total_rows hace su magia
+            let db = CursorDB::open_or_create(db_path, index_path).unwrap();
+            let stats = db.stats().unwrap();
+
+            assert_eq!(
+                stats.total_records, 2,
+                "Persistencia: Debe seguir habiendo 2 registros"
+            );
+        }
+
+        // Limpieza final
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(index_path);
+    }
 }
