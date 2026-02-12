@@ -2,6 +2,7 @@ use crate::record::Record;
 use crc32fast::Hasher;
 use std::fmt;
 use std::fs::{File, OpenOptions};
+use std::io::{Error, ErrorKind, Result};
 use std::io::{Read, Seek, SeekFrom, Write};
 
 const INDEX_STRIDE: u64 = 1024;
@@ -296,14 +297,8 @@ impl CursorDB {
         let last_entry = self.index.last().map(|e| (e.row_number, e.file_offset));
 
         let (mut row_count, mut current_off) = if let Some((row_num, offset)) = last_entry {
-            // Si hay índice, necesitamos saber dónde TERMINA ese registro indexado
-            // Llamamos a read_record_at FUERA de cualquier cierre sobre self.index
-            let (_, next_off) = self.read_record_at(offset).ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "Last indexed record truncated",
-                )
-            })?;
+            // Si el último registro del índice está corrupto, la apertura fallará con el motivo real.
+            let (_, next_off) = self.read_record_at(offset)?;
 
             (row_num + 1, next_off)
         } else {
@@ -312,20 +307,14 @@ impl CursorDB {
 
         // 2. ESCANEO (Ya no hay conflictos de préstamo)
         while current_off < file_len {
-            if let Some((_, next_off)) = self.read_record_at(current_off) {
-                current_off = next_off;
-                row_count += 1;
-            } else {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!(
-                        "Integrity violation at offset {}. Partial record found.",
-                        current_off
-                    ),
-                ));
-            }
-        }
+            // Ya no necesitamos un 'else' manual para lanzar errores.
+            // Si read_record_at encuentra un CRC inválido o un archivo truncado,
+            // detendrá el bucle y saldrá de la función devolviendo ese error exacto.
+            let (_, next_off) = self.read_record_at(current_off)?;
 
+            current_off = next_off;
+            row_count += 1;
+        }
         // 3. ACTUALIZAR ESTADO
         self.total_rows = row_count;
         self.last_valid_offset = current_off;
@@ -382,43 +371,68 @@ impl CursorDB {
         Ok(())
     }
 
-    pub fn current(&mut self) -> Option<Record> {
+    pub fn current(&mut self) -> std::io::Result<Option<Record>> {
+        // Si no hay registros, no es un error, simplemente no hay nada que mostrar.
         if self.total_rows == 0 {
-            return None;
+            return Ok(None);
         }
-        // read_record_at ya hace el seek interno, así que es seguro.
+
+        // Ahora el '?' de read_record_at funciona perfectamente porque
+        // la función devuelve Result.
+        // Si el registro está corrupto, el error sube al usuario.
         let (record, _) = self.read_record_at(self.current_offset)?;
-        Some(record)
+
+        Ok(Some(record))
     }
 
-    fn read_record_at(&mut self, offset: u64) -> Option<(Record, u64)> {
+    fn read_record_at(&mut self, offset: u64) -> Result<(Record, u64)> {
         // 1. Posicionarnos en el inicio del registro
-        self.data_file.seek(SeekFrom::Start(offset)).ok()?;
+        self.data_file.seek(SeekFrom::Start(offset))?;
 
         // 2. Leer el Header completo (16 bytes: 8 ts + 4 size + 4 crc)
-        let mut header_buf = [0u8; 16];
-        if self.data_file.read_exact(&mut header_buf).is_err() {
-            return None; // No hay suficientes bytes para un header completo
+        let mut header_buf: [u8; 16] = [0u8; 16];
+
+        if let Err(e) = self.data_file.read_exact(&mut header_buf) {
+            return if e.kind() == ErrorKind::UnexpectedEof {
+                // Si el archivo se acaba aquí, es un error de datos inválidos (truncado)
+                Err(Error::new(ErrorKind::InvalidData, "Header incompleto"))
+            } else {
+                Err(e)
+            };
         }
 
-        let timestamp = i64::from_le_bytes(header_buf[0..8].try_into().unwrap());
-        let size = u32::from_le_bytes(header_buf[8..12].try_into().unwrap()) as usize;
-        let stored_checksum = u32::from_le_bytes(header_buf[12..16].try_into().unwrap());
+        let timestamp: i64 = i64::from_le_bytes(header_buf[0..8].try_into().unwrap());
+        let size: usize = u32::from_le_bytes(header_buf[8..12].try_into().unwrap()) as usize;
+        let stored_checksum: u32 = u32::from_le_bytes(header_buf[12..16].try_into().unwrap());
 
-        let file_len: u64 = self.data_file.metadata().ok()?.len();
-        if size > MAX_PAYLOAD_SIZE || (offset + 16 + size as u64) > file_len {
-            eprintln!(
-                "ERROR: Registro en offset {} excede límites de tamaño o está truncado.",
-                offset
-            );
-            return None;
+        let file_len: u64 = self.data_file.metadata()?.len();
+
+        if size > MAX_PAYLOAD_SIZE {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!(
+                    "El registro indica un tamaño de {} bytes, lo cual supera el límite de {} bytes",
+                    size, MAX_PAYLOAD_SIZE
+                ),
+            ));
+        }
+
+        if (offset + 16 + size as u64) > file_len {
+            return Err(Error::new(
+                ErrorKind::UnexpectedEof,
+                format!(
+                    "Registro en offset {} está truncado: se esperaban {} bytes totales pero el archivo mide {}",
+                    offset,
+                    16 + size,
+                    file_len
+                ),
+            ));
         }
 
         // 3. Leer el Payload
         let mut payload = vec![0u8; size];
-        if self.data_file.read_exact(&mut payload).is_err() {
-            return None; // Payload incompleto o archivo truncado
-        }
+
+        self.data_file.read_exact(&mut payload)?;
 
         // 4. VALIDACIÓN DE INTEGRIDAD (CRC32)
         let mut hasher = crc32fast::Hasher::new();
@@ -426,48 +440,60 @@ impl CursorDB {
         let computed_checksum = hasher.finalize();
 
         if computed_checksum != stored_checksum {
-            // Corrupción de datos detectada: el contenido no coincide con su firma
-            return None;
+            // El error de InvalidData es perfecto aquí porque el archivo existe
+            // y se leyó bien, pero el contenido "no es válido".
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!(
+                    "Corrupción de datos: El CRC32 calculado ({:08x}) no coincide con el guardado ({:08x}) en el offset {}",
+                    computed_checksum, stored_checksum, offset
+                ),
+            ));
         }
 
         // 5. Calcular el siguiente offset: Header (16) + Payload (size)
-        let next_offset = offset + 16 + size as u64;
+        let next_offset: u64 = offset + 16 + size as u64;
 
-        Some((Record { timestamp, payload }, next_offset))
+        Ok((Record { timestamp, payload }, next_offset))
     }
 
-    pub fn next(&mut self) -> Option<Record> {
-        // Si ya estamos en la última fila o la DB está vacía, no hay siguiente.
+    pub fn next(&mut self) -> std::io::Result<Option<Record>> {
+        // 1. Verificar si ya llegamos al final lógico
         if self.total_rows == 0 || self.current_row + 1 >= self.total_rows {
-            return None;
+            return Ok(None);
         }
 
-        // 1. Obtener el offset del registro que sigue al actual
+        // 2. Calcular dónde empieza el siguiente registro.
+        // Primero necesitamos saber dónde termina el actual para saltar al siguiente.
+        // Nota: Si quisiéramos ser más eficientes, podríamos guardar 'next_offset' en el struct.
         let (_, next_offset) = self.read_record_at(self.current_offset)?;
 
-        // 2. Intentar leer el registro en esa nueva posición
-        if let Some((record, _)) = self.read_record_at(next_offset) {
-            self.current_row += 1;
-            self.current_offset = next_offset;
-            Some(record)
-        } else {
-            None
-        }
+        // 3. Leer el registro que sigue
+        // El '?' aquí capturará cualquier error de CRC o de lectura física.
+        let (record, _new_next_offset) = self.read_record_at(next_offset)?;
+
+        // 4. Actualizar el estado del cursor solo si la lectura fue exitosa
+        self.current_row += 1;
+        self.current_offset = next_offset;
+
+        Ok(Some(record))
     }
 
-    pub fn back(&mut self) -> Option<Record> {
+    pub fn back(&mut self) -> std::io::Result<Option<Record>> {
         // Si estamos al inicio, no hay nada atrás
         if self.current_row == 0 || self.total_rows == 0 {
-            return None;
+            return Ok(None);
         }
 
         // BUSQUEDA BINARIA: Encontrar la entrada de índice más cercana que sea < current_row
         let pos = self
             .index
             .partition_point(|e| e.row_number < self.current_row);
+
         if pos == 0 {
-            return None;
+            return Ok(None);
         }
+
         let idx_entry = &self.index[pos - 1];
 
         let mut row = idx_entry.row_number;
@@ -487,9 +513,9 @@ impl CursorDB {
         self.current()
     }
 
-    pub fn move_cursor_at(&mut self, ts: i64) -> Option<Record> {
+    pub fn move_cursor_at(&mut self, ts: i64) -> std::io::Result<Option<Record>> {
         if self.total_rows == 0 {
-            return None;
+            return Ok(None);
         }
 
         // Encontrar la última entrada de índice cuyo timestamp sea <= ts
@@ -506,34 +532,30 @@ impl CursorDB {
 
         // Escaneo lineal hasta encontrar el timestamp exacto o el siguiente superior
         loop {
+            // El '?' captura fallos de lectura o corrupción en el proceso de búsqueda
             let (record, next_offset) = self.read_record_at(self.current_offset)?;
+
+            // Si encontramos el registro o nos pasamos (lo que significa que el TS exacto no existe)
             if record.timestamp >= ts {
-                return Some(record);
+                return Ok(Some(record));
             }
 
+            // Si llegamos al último registro de la base de datos sin encontrar un TS >= ts
             if self.current_row + 1 >= self.total_rows {
-                return None; // Llegamos al final sin encontrarlo
+                return Ok(None);
             }
 
+            // Avanzamos el cursor interno
             self.current_offset = next_offset;
             self.current_row += 1;
         }
     }
 
-    pub fn range_around_cursor(&mut self, before: u64, after: u64) -> Vec<Record> {
-        if self.total_rows == 0 {
-            return Vec::new();
-        }
-
-        // 1. Calcular límites lógicos
+    fn execute_range_scan(&mut self, before: u64, after: u64) -> std::io::Result<Vec<Record>> {
         let start_row = self.current_row.saturating_sub(before);
         let end_row = (self.current_row + after).min(self.total_rows - 1);
 
-        // 2. Guardar estado para restaurarlo (Determinismo)
-        let saved_row = self.current_row;
-        let saved_offset = self.current_offset;
-
-        // 3. BUSQUEDA BINARIA para encontrar el punto de partida más cercano en el índice
+        // 1. Localizar punto de inicio en el índice
         let pos = self.index.partition_point(|e| e.row_number <= start_row);
         let (mut row, mut offset) = if pos == 0 {
             (0, 0)
@@ -542,26 +564,41 @@ impl CursorDB {
             (idx.row_number, idx.file_offset)
         };
 
-        let mut results = Vec::new();
+        let mut results = Vec::with_capacity((before + after + 1) as usize);
 
-        // 4. Escaneo lineal optimizado (solo desde el índice más cercano hasta end_row)
+        // 2. Escaneo lineal con validación
         while row <= end_row {
-            if let Some((record, next_offset)) = self.read_record_at(offset) {
-                if row >= start_row {
-                    results.push(record);
-                }
-                offset = next_offset;
-                row += 1;
-            } else {
-                break;
+            // El '?' detiene el escaneo si hay un error de CRC o lectura
+            let (record, next_offset) = self.read_record_at(offset)?;
+
+            if row >= start_row {
+                results.push(record);
             }
+
+            offset = next_offset;
+            row += 1;
         }
 
-        // 5. Restaurar cursor original
+        Ok(results)
+    }
+
+    pub fn range_around_cursor(&mut self, before: u64, after: u64) -> std::io::Result<Vec<Record>> {
+        if self.total_rows == 0 {
+            return Ok(Vec::new());
+        }
+
+        // Guardar estado inicial para restaurarlo al final
+        let saved_row = self.current_row;
+        let saved_offset = self.current_offset;
+
+        // Usamos un patrón de "defer" manual para asegurar la restauración incluso si hay errores
+        let result = self.execute_range_scan(before, after);
+
+        // Restaurar siempre el cursor original
         self.current_row = saved_row;
         self.current_offset = saved_offset;
 
-        results
+        result
     }
 }
 
