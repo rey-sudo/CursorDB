@@ -2,8 +2,9 @@ use crate::record::Record;
 use crc32fast::Hasher;
 use std::fmt;
 use std::fs::{File, OpenOptions};
+use std::io::Write;
 use std::io::{Error, ErrorKind, Result};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom};
 
 const INDEX_STRIDE: u64 = 1024;
 const MAX_PAYLOAD_SIZE: usize = 16 * 1024 * 1024;
@@ -618,59 +619,60 @@ mod tests {
         let _ = std::fs::remove_file(index_path);
 
         {
-            // 1. Creación y escritura
-            // Usamos ? porque si falla la creación, el test debe fallar con el error de IO
+            // Creation and writing
             let mut db: CursorDB = CursorDB::open_or_create(db_path, index_path)?;
             db.append(1000, b"data 1")?;
             db.append(2000, b"data 2")?;
 
             let stats: DBStats = db.stats()?;
-            assert_eq!(stats.total_records, 2, "Debe haber 2 registros");
+            assert_eq!(stats.total_records, 2, "There must be 2 records");
         }
 
         {
-            // 2. Reapertura y validación de Reconciliación
+            // Reopening and Validation of Reconciliation
             let mut db: CursorDB = CursorDB::open_or_create(db_path, index_path)?;
             let stats: DBStats = db.stats()?;
 
             assert_eq!(
                 stats.total_records, 2,
-                "Persistencia: Debe seguir habiendo 2 registros tras la reapertura"
+                "Persistence: There must still be 2 records after reopening"
             );
 
-            // 3. Probando la nueva navegación con Result
-            let first: Record = db
-                .move_cursor_at(0)?
-                .expect("Debe existir el primer registro");
+            // Proving individual existence.
+            let first: Record = db.move_cursor_at(0)?.expect("The first record must exist");
+
             assert_eq!(first.timestamp, 1000);
 
-            let second = db.next()?.expect("Debe existir el segundo registro");
+            let second: Record = db.next()?.expect("The second record must exist");
             assert_eq!(second.timestamp, 2000);
         }
 
-        // 4. EXTRA: TEST DE CORRUPCIÓN (La prueba de fuego para tu nuevo Result)
+        // 4. Testing for corruption
         {
-            use std::io::Write;
-            // Abrimos el archivo manualmente y saboteamos un byte de los datos
-            let mut f = std::fs::OpenOptions::new().write(true).open(db_path)?;
-            f.seek(std::io::SeekFrom::Start(20))?; // Saltamos el header y tocamos el payload
+            // Open the file manually
+            let mut f: File = std::fs::OpenOptions::new().write(true).open(db_path)?;
+
+            // Move the file pointer to byte 20 from the beginning.
+            // Since the header is 16 bytes, byte 20 is exactly 4 bytes into the first payload.
+            // This targets the data itself rather than the structural metadata.
+            f.seek(std::io::SeekFrom::Start(20))?;
+
+            // Overwrite the original byte at that position with the character 'X'.
+            // This "bit-flip" simulation ensures that the stored CRC32 checksum
+            // will no longer match the recalculated checksum of the modified payload.
             f.write_all(b"X")?;
 
-            // Intentamos abrir la DB. reconcile_total_rows fallará porque el CRC no coincidirá
             let result: std::result::Result<CursorDB, Error> =
                 CursorDB::open_or_create(db_path, index_path);
 
             assert!(
                 result.is_err(),
-                "La DB NO debería abrirse si hay corrupción de CRC"
+                "The database should not be opened due to checksum corruption"
             );
-            println!(
-                "Éxito: El sistema detectó la corrupción: {:?}",
-                result.err()
-            );
+            println!("The system found a checksum error: {:?}", result.err());
         }
 
-        // Limpieza final
+        // Final cleaning
         let _ = std::fs::remove_file(db_path);
         let _ = std::fs::remove_file(index_path);
         Ok(())
