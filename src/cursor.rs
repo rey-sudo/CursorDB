@@ -665,6 +665,9 @@ impl CursorDB {
             return Ok(None);
         }
 
+        let saved_row = self.current_row;
+        let saved_offset = self.current_offset;
+
         // 1. Salto rápido: Encontrar la última entrada de índice cuyo timestamp sea <= ts
         let pos = self.index.partition_point(|e| e.timestamp <= ts);
         if pos == 0 {
@@ -687,13 +690,15 @@ impl CursorDB {
 
             // CASO A: Nos pasamos del timestamp (no existe en el archivo ordenado)
             if record.timestamp > ts {
+                self.current_row = saved_row;
+                self.current_offset = saved_offset;
                 return Ok(None);
             }
 
             // CASO B: Llegamos al último registro sin encontrar el timestamp
             if self.current_row + 1 >= self.total_rows {
-                self.current_row = self.total_rows;
-                self.current_offset = next_offset; // Este ya es el final físico (EOF)
+                self.current_row = saved_row;
+                self.current_offset = saved_offset;
                 return Ok(None);
             }
 
@@ -1031,88 +1036,82 @@ mod tests {
     #[test]
     fn test_cursor_ultimate_robustness() -> std::io::Result<()> {
         let db_name = "ultimate_robust_test";
-        let mut db = setup_db(db_name);
 
-        // --- 1. PREPARACIÓN: Insertamos 1500 registros ---
-        // Usamos timestamps pares (1000, 1002, 1004...) para probar búsquedas de impares
+        // Limpieza inicial por si acaso
+        let _ = std::fs::remove_file(format!("{}.cdb", db_name));
+        let _ = std::fs::remove_file(format!("{}.cdbi", db_name));
+
+        let mut db =
+            CursorDB::open_or_create(&format!("{}.cdb", db_name), &format!("{}.cdbi", db_name))?;
+
+        // --- 1. PREPARACIÓN: 1500 registros con timestamps pares (1000, 1002, 1004...) ---
         for i in 0..1500 {
             db.append(1000 + (i * 2) as i64, b"payload")?;
         }
 
         // --- 2. TEST DE PERSISTENCIA Y CARGA ---
-        // Cerramos y reabrimos para forzar la carga del índice desde el disco (.cdbi)
         drop(db);
         let mut db =
             CursorDB::open_or_create(&format!("{}.cdb", db_name), &format!("{}.cdbi", db_name))?;
-        assert_eq!(
-            db.total_rows, 1500,
-            "La persistencia falló al recuperar el conteo de filas"
-        );
+        assert_eq!(db.total_rows(), 1500, "La carga del índice falló");
 
-        // --- 3. TEST DE NAVEGACIÓN HACIA ATRÁS (BACK) ---
-        db.move_to_last()?;
-        let rec = db.current()?.unwrap();
-        assert_eq!(rec.timestamp, 1000 + (1499 * 2) as i64);
+        // --- 3. POSICIONAMIENTO INICIAL ---
+        // Nos movemos a la fila 50 (TS 1100) para tener un punto de referencia fijo
+        db.move_cursor_at(1100)?;
+        assert_eq!(db.current_row(), 50, "Debería estar en la fila 50");
 
-        // Retrocedemos 5 pasos
-        for _ in 0..5 {
-            db.back()?;
-        }
-        assert_eq!(db.current()?.unwrap().timestamp, 1000 + (1494 * 2) as i64);
+        // --- 4. TEST DE BÚSQUEDA NO DESTRUCTIVA (MOVE_CURSOR_AT) ---
 
-        // --- 4. TEST DE ÍNDICE MUTILADO (FALLBACK) ---
-        // Borramos el índice de la memoria. back() ahora debe usar escaneo lineal desde 0.
-        db.clear_index_in_memory();
-        let rec_fallback = db
-            .back()?
-            .expect("Back debe funcionar mediante escaneo lineal si no hay índice");
-        assert_eq!(rec_fallback.timestamp, 1000 + (1493 * 2) as i64);
-
-        // --- 5. TEST DE BÚSQUEDA (MOVE_CURSOR_AT) ---
-
-        // CASO A: Timestamp exacto
-        let found = db.move_cursor_at(1100)?; // 1000 + (50 * 2)
-        assert!(found.is_some());
-        assert_eq!(db.current_row, 50);
-
-        // CASO B: Timestamp inexistente (hueco entre registros)
-        // Buscamos 1101, pero solo existen 1100 y 1102. Debe devolver None y mover a EOF.
+        // CASO A: Timestamp inexistente (Hueco: buscamos 1101)
+        // El motor debe intentar buscarlo, fallar, y devolver el cursor a la fila 50.
         let missing_gap = db.move_cursor_at(1101)?;
-        assert!(
-            missing_gap.is_none(),
-            "Debe ser None porque el TS 1101 no existe"
-        );
+        assert!(missing_gap.is_none());
         assert_eq!(
-            db.current_row, 1500,
-            "El cursor debe quedar en el EOF tras búsqueda fallida"
+            db.current_row(),
+            50,
+            "ERROR: El cursor se movió tras un fallo de búsqueda (Hueco)"
         );
 
-        // CASO C: Timestamp inexistente (pasado lejano)
+        // CASO B: Pasado lejano (Buscamos 500)
+        // Debe restaurar el cursor a la fila 50.
         let missing_past = db.move_cursor_at(500)?;
         assert!(missing_past.is_none());
         assert_eq!(
-            db.current_row, 1500,
-            "Búsqueda en el pasado fallida debe llevar al EOF"
+            db.current_row(),
+            50,
+            "ERROR: El cursor se movió tras un fallo de búsqueda (Pasado)"
         );
 
-        // CASO D: Timestamp inexistente (futuro lejano)
+        // CASO C: Futuro lejano (Buscamos 9999)
+        // Debe restaurar el cursor a la fila 50.
         let missing_future = db.move_cursor_at(9999)?;
         assert!(missing_future.is_none());
         assert_eq!(
-            db.current_row, 1500,
-            "Búsqueda en el futuro fallida debe llevar al EOF"
+            db.current_row(),
+            50,
+            "ERROR: El cursor se movió tras un fallo de búsqueda (Futuro)"
         );
 
-        // --- 6. RECUPERACIÓN TRAS FALLO ---
-        // Verificamos que tras un fallo de búsqueda, back() puede traernos de vuelta al último registro
-        let rescue = db
-            .back()?
-            .expect("Back debe poder rescatar al cursor del EOF");
-        assert_eq!(rescue.timestamp, 1000 + (1499 * 2) as i64);
+        // --- 5. TEST DE NAVEGACIÓN DESDE EL PUNTO RESTAURADO ---
+        // Como el cursor sigue en la 50, back() debe llevarnos a la 49 sin problemas.
+        let prev = db.back()?.expect("Navegación back() fallida tras búsqueda");
+        assert_eq!(db.current_row(), 49);
+        assert_eq!(prev.timestamp, 1000 + (49 * 2) as i64);
 
-        // Limpieza
-        fs::remove_file(format!("{}.cdb", db_name))?;
-        fs::remove_file(format!("{}.cdbi", db_name))?;
+        // --- 6. TEST DE ÍNDICE MUTILADO (FALLBACK) ---
+        // Limpiamos el índice en RAM y probamos un back().
+        // Debe usar el escaneo lineal desde el inicio para encontrar la fila 48.
+        db.clear_index_in_memory();
+        let rec_fallback = db.back()?.expect("Back lineal falló sin índice");
+        assert_eq!(db.current_row(), 48);
+        assert_eq!(rec_fallback.timestamp, 1000 + (48 * 2) as i64);
+
+        // Limpieza final
+        drop(db);
+        std::fs::remove_file(format!("{}.cdb", db_name))?;
+        std::fs::remove_file(format!("{}.cdbi", db_name))?;
+
+        println!("✅ Test de Robustez Ultimate completado con éxito.");
         Ok(())
     }
 
