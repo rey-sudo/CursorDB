@@ -1115,4 +1115,67 @@ mod tests {
         let _ = fs::remove_file(format!("{}.cdbi", db_name));
         Ok(())
     }
+
+    #[test]
+    fn test_cursor_full_lifecycle_integration() -> std::io::Result<()> {
+        let db_name = "full_lifecycle_test";
+        let mut db = setup_db(db_name);
+
+        // 1. APPEND: 10 registros (Timestamps 100 al 1000)
+        for i in 1..=10 {
+            db.append((i * 100) as i64, format!("payload_{}", i).as_bytes())?;
+        }
+
+        // 2. MOVE_CURSOR_AT & CURRENT
+        let rec = db.move_cursor_at(500)?.expect("Debe encontrar TS 500");
+        assert_eq!(rec.timestamp, 500);
+        assert_eq!(db.current_row, 4);
+
+        let curr = db.current()?.unwrap();
+        assert_eq!(curr.timestamp, 500);
+
+        // 3. NEXT & BACK
+        db.next()?; // 600
+        db.next()?; // 700
+        assert_eq!(db.current()?.unwrap().timestamp, 700);
+
+        db.back()?; // 600
+        assert_eq!(db.current()?.unwrap().timestamp, 600);
+
+        // 4. READ_RECORD_AT (Sin romper el índice)
+        // En lugar de acceder al índice[1], leemos el offset del registro actual
+        // para verificar que read_record_at funciona sin mover el cursor.
+        let current_off = db.current_offset;
+        let (rec_static, _) = db.read_record_at(current_off)?;
+        assert_eq!(rec_static.timestamp, 600);
+        assert_eq!(db.current_row, 5, "El cursor no debe haberse movido");
+
+        // 5. RANGE_AROUND_CURSOR
+        // En 600 (fila 5), pedimos 1 antes y 1 después: [500, 600, 700]
+        let range = db.range_around_cursor(1, 1)?;
+        assert_eq!(range.len(), 3);
+        assert_eq!(range[0].timestamp, 500);
+        assert_eq!(range[1].timestamp, 600);
+        assert_eq!(range[2].timestamp, 700);
+
+        // 6. MOVE_TO_LAST
+        db.move_to_last()?;
+        assert_eq!(db.current()?.unwrap().timestamp, 1000);
+        assert_eq!(db.current_row, 9);
+
+        // 7. COMPORTAMIENTO EN FRONTERA FINAL (EOF)
+        db.next()?;
+        assert!(db.current()?.is_none());
+        assert_eq!(db.current_row, 10);
+
+        // 8. REGRESO DESDE EL VACÍO
+        db.back()?;
+        assert_eq!(db.current()?.unwrap().timestamp, 1000);
+        assert_eq!(db.current_row, 9);
+
+        // Limpieza
+        let _ = fs::remove_file(format!("{}.cdb", db_name));
+        let _ = fs::remove_file(format!("{}.cdbi", db_name));
+        Ok(())
+    }
 }
