@@ -739,7 +739,8 @@ mod tests {
 
     #[test]
     fn test_cursor_logical_consistency() -> std::io::Result<()> {
-        let mut db = setup_db("logical_test");
+        let db_name: &str = "logical_test";
+        let mut db = setup_db(db_name);
 
         // 1. Inserción masiva para forzar creación de varios índices
         // Con INDEX_STRIDE = 1024, insertamos 3000 registros
@@ -785,12 +786,16 @@ mod tests {
         let first = db.current()?.unwrap();
         assert_eq!(first.timestamp, 1000);
 
+        let _ = fs::remove_file(format!("{}.cdb", db_name));
+        let _ = fs::remove_file(format!("{}.cdbi", db_name));
         Ok(())
     }
 
     #[test]
     fn test_deterministic_cursor_boundaries() -> std::io::Result<()> {
-        let mut db = setup_db("boundary_test");
+        let db_name: &str = "boundary_test";
+
+        let mut db = setup_db(db_name);
         // Insertamos 10 registros (0 al 9)
         for i in 0..10 {
             db.append(i as i64, format!("p-{}", i).as_bytes())?;
@@ -821,12 +826,16 @@ mod tests {
         db.move_to_last()?;
         assert_eq!(db.current_row(), 9);
 
+        let _ = fs::remove_file(format!("{}.cdb", db_name));
+        let _ = fs::remove_file(format!("{}.cdbi", db_name));
         Ok(())
     }
 
     #[test]
     fn test_cursor_complete_universe() -> std::io::Result<()> {
-        let mut db = setup_db("complete_universe_test");
+        let db_name: &str =  "complete_universe_test";
+
+        let mut db = setup_db(db_name);
 
         let payloads = vec![
             vec![1u8; 10],   // Fila 0
@@ -842,7 +851,7 @@ mod tests {
             // Obtenemos el tamaño del archivo directamente del sistema operativo
             // para saber exactamente dónde se escribirá el siguiente registro.
             let offset_fisico =
-                std::fs::metadata(&format!("{}.cdb", "complete_universe_test"))?.len();
+                std::fs::metadata(&format!("{}.cdb", db_name))?.len();
             expected_offsets.push(offset_fisico);
 
             db.append(1000 + i as i64, p)?;
@@ -874,11 +883,15 @@ mod tests {
 
         // Límite BOF
         assert!(db.back()?.is_none());
+
+        let _ = fs::remove_file(format!("{}.cdb", db_name));
+        let _ = fs::remove_file(format!("{}.cdbi", db_name));
         Ok(())
     }
 
     #[test]
     fn test_cursor_persistence_and_recovery() -> std::io::Result<()> {
+
         let db_path = "pers_test.cdb";
         let idx_path = "pers_test.cdbi";
         let _ = fs::remove_file(db_path);
@@ -908,6 +921,9 @@ mod tests {
                 db.back()?;
             }
         }
+
+        let _ = fs::remove_file(format!("{}", db_path));
+        let _ = fs::remove_file(format!("{}", idx_path));
 
         Ok(())
     }
@@ -1002,7 +1018,9 @@ mod tests {
 
     #[test]
     fn test_cursor_stride_boundaries() -> std::io::Result<()> {
-        let mut db = setup_db("stride_test");
+        let db_name: &str = "stride_test";
+
+        let mut db = setup_db(db_name);
         let stride = 1024; // Asumiendo que tu constante es esta
 
         // 1. Insertamos justo hasta el límite del primer salto de índice
@@ -1018,12 +1036,15 @@ mod tests {
         db.back()?;
         assert_eq!(db.current_row(), (stride - 1) as u64);
 
+        let _ = fs::remove_file(format!("{}.cdb", db_name));
+        let _ = fs::remove_file(format!("{}.cdbi", db_name));
         Ok(())
     }
 
     #[test]
     fn test_cursor_exhaustive_traversal() -> std::io::Result<()> {
-        let mut db = setup_db("exhaustive_test");
+        let db_name: &str = "exhaustive_test";
+        let mut db = setup_db(db_name);
 
         for i in 1..=10 {
             db.append((i * 10) as i64, format!("data_{}", i).as_bytes())?;
@@ -1059,6 +1080,9 @@ mod tests {
             "Back desde la fila 0 DEBE devolver None"
         );
         assert_eq!(db.current_row, 0, "El cursor no debe moverse de 0");
+
+        fs::remove_file(format!("{}.cdb", db_name))?;
+        fs::remove_file(format!("{}.cdbi", db_name))?;
 
         Ok(())
     }
@@ -1175,7 +1199,7 @@ mod tests {
         // Limpieza
         let _ = fs::remove_file(format!("{}.cdb", db_name));
         let _ = fs::remove_file(format!("{}.cdbi", db_name));
-        
+
         Ok(())
     }
 }
