@@ -16,18 +16,18 @@ const MAX_PAYLOAD_SIZE: usize = 16 * 1024 * 1024;
 /// specific neighborhood in the file, significantly reducing linear scan time.
 #[derive(Debug, Clone)]
 pub struct IndexEntry {
-    /// The logical zero-based sequence number of the record.
+    /// The logical zero-based sequence number of the record 8-bytes.
     ///
     /// Used for row-based navigation and range queries. This acts as a
     /// stable identifier for the record within the append-only stream.
     pub row_number: u64,
-    /// High-precision Unix timestamp (Microseconds).
+    /// High-precision Unix timestamp (Microseconds) 8-bytes.
     ///
     /// Facilitates time-series queries and chronological sorting. Using an `i64`
     /// ensures compatibility with standard time libraries and allows for
     /// signed duration arithmetic.
     pub timestamp: i64,
-    /// The physical starting position (in bytes) of the record within the data file.
+    /// The physical starting position (8-bytes) of the record within the data file.
     ///
     /// This offset is used by the disk controller to perform a `seek` operation
     /// directly to the record's header before reading the payload.
@@ -229,7 +229,7 @@ impl CursorDB {
             .write(true)
             .open(data_path)?;
 
-        // Open the companion index file.
+        // Open the index .cbi file
         let index_file: File = OpenOptions::new()
             .create(true)
             .read(true)
@@ -252,39 +252,66 @@ impl CursorDB {
         Ok(db)
     }
 
-    /// Lee el archivo de índice y puebla la memoria.
+    /// Loads the sparse index from the `.cdbi` file into memory.
+    ///
+    /// This function performs the following steps:
+    /// 1. Reads the entire index file into a memory buffer for fast sequential processing.
+    /// 2. Iteratively parses 24-byte chunks into `IndexEntry` structures.
+    /// 3. Updates `self.total_rows` based on the last indexed row to provide a starting point.
+    /// 4. Calls `reconcile_total_rows` to sync the index with the data in the main .cdb file.
     fn load_index(&mut self) -> std::io::Result<()> {
-        let mut buf = Vec::new();
+        let mut buf: Vec<u8> = Vec::new();
+
+        // Reset file pointer to the beginning to ensure a full read
         self.index_file.seek(SeekFrom::Start(0))?;
         self.index_file.read_to_end(&mut buf)?;
 
-        let entry_size = 24;
-        let mut offset = 0;
+        // Each entry consists of: row_number(8) + timestamp(8) + file_offset(8) = 24 bytes
+        let entry_size: usize = 24;
+        let mut offset: usize = 0;
 
+        // Process the buffer while there is at least one full entry remaining
         while offset + entry_size <= buf.len() {
-            // Conversión segura sin panics si el archivo está truncado
-            let row = u64::from_le_bytes(buf[offset..offset + 8].try_into().map_err(|_| {
-                std::io::Error::new(std::io::ErrorKind::InvalidData, "Error en row_number")
-            })?);
-            let ts = i64::from_le_bytes(buf[offset + 8..offset + 16].try_into().map_err(|_| {
-                std::io::Error::new(std::io::ErrorKind::InvalidData, "Error en timestamp")
-            })?);
-            let file_offset =
-                u64::from_le_bytes(buf[offset + 16..offset + 24].try_into().map_err(|_| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidData, "Error en file_offset")
+            // 1. buf[offset..offset + 8]: Extract a 8-byte "slice" (offsets 0-7) from the buffer starting at the current offset.
+            // 2. .try_into(): Attempt to convert the dynamic slice into a fixed-size array [u8; 8].
+            //    This is required because the conversion function needs a guaranteed size at compile time.
+            // 3. u64::from_le_bytes(...): Interpret those 8 bytes as a 64-bit integer using
+            //    Little Endian byte order (the standard for modern CPUs like Intel, AMD, and ARM).
+            let row: u64 =
+                u64::from_le_bytes(buf[offset..offset + 8].try_into().map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, "Error in row_number")
                 })?);
 
+            // Extracts 8 bytes from the buffer (offsets 8-15) and safely converts them from Little Endian to a 64-bit signed integer timestamp.
+            let ts: i64 =
+                i64::from_le_bytes(buf[offset + 8..offset + 16].try_into().map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, "Error in timestamp")
+                })?);
+
+            // Parse file_offset (Bytes 16-23): Byte position in the .cdb data file
+            let file_offset: u64 =
+                u64::from_le_bytes(buf[offset + 16..offset + 24].try_into().map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, "Error in file_offset")
+                })?);
+
+            // Store the entry in the in-memory sparse index
             self.index.push(IndexEntry {
                 row_number: row,
                 timestamp: ts,
                 file_offset,
             });
 
+            // Set total_rows to the next available ID.
+            // If the last indexed row ID is N, then the total count of records is N + 1.
+            // This ensures the next append() uses the correct subsequent ID.
             self.total_rows = row + 1;
+
+            // Advance buffer pointer
             offset += entry_size;
         }
 
-        // Una vez cargado el índice, conciliamos con los datos reales en el log
+        // Scan the data file from the last indexed position to find and count
+        // any records that were added but haven't been indexed yet.
         self.reconcile_total_rows()
     }
 

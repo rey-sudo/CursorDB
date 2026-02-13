@@ -20,9 +20,6 @@ fn main() -> std::io::Result<()> {
     let stats: DBStats = db.stats()?;
     println!("{}", stats);
 
-    // --- MANEJO DE RESULT<OPTION> ---
-    // Usamos match o '?' dependiendo de si queremos que el programa muera ante corrupción
-
     match db.move_cursor_at(0)? {
         // El '?' maneja el error de disco/CRC
         Some(r) => println!("Encontrado: {}", r.timestamp),
@@ -71,7 +68,7 @@ fn main() -> std::io::Result<()> {
             break;
         }
     }
-    
+
     if let Some(rec) = db.current()? {
         println!("Registro actual: {:?}", rec.timestamp);
     }
