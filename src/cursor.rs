@@ -143,12 +143,7 @@ impl fmt::Display for DBStats {
             "Avg Record Size",
             Self::format_bytes(self.average_record_size)
         )?;
-        writeln!(
-            f,
-            "{:<22}: {}",
-            "Orphan Data Ratio",
-            self.orphan_data_ratio
-        )?;        
+        writeln!(f, "{:<22}: {}", "Orphan Data Ratio", self.orphan_data_ratio)?;
         writeln!(f, "{}", "━".repeat(35))?;
 
         if self.orphan_data_ratio > 0.0 {
@@ -301,6 +296,15 @@ impl CursorDB {
             last_valid_offset: 0,
             data_path: data_path.to_string(),
         };
+
+        if db.total_rows() > 0 {
+            // IMPORTANTE: Asegúrate de hacer un flush antes si sospechas que hay datos pendientes
+            db.data_file.flush()?;
+
+            // Si la verificación falla aquí, open_or_create devolverá Err
+            // impidiendo que uses una DB corrupta.
+            db.verify_deterministic_integrity()?;
+        }
 
         db.load_index()?;
 
@@ -827,6 +831,16 @@ impl CursorDB {
                     ),
                 )
             })?;
+
+            if next_pos <= current_pos {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "Error crítico: Avance de cursor nulo o negativo en offset {}",
+                        current_pos
+                    ),
+                ));
+            }
 
             // Verificación cruzada con los datos extraídos
             if let Some(off) = expected_offset {
