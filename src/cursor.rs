@@ -86,6 +86,14 @@ pub struct DBStats {
     pub orphan_data_ratio: f64,
 }
 
+#[derive(Debug)]
+pub struct AuditReport {
+    pub total_records_found: u64,
+    pub total_bytes_processed: u64,
+    pub index_validation_count: usize,
+    pub status: String,
+}
+
 impl DBStats {
     /// Converts a raw byte count into a human-readable string (e.g., 300.00 GB).
     ///
@@ -722,6 +730,78 @@ impl CursorDB {
 
         result
     }
+
+    pub fn verify_deterministic_integrity(&mut self) -> std::io::Result<AuditReport> {
+        let file_len = self.data_file.metadata()?.len();
+        let mut current_pos: u64 = 0;
+        let mut row_counter: u64 = 0;
+
+        // 1. Usamos un clon local del vector para iterar sin bloquear a 'self'
+        let index_snapshot = self.index.clone();
+        let mut index_it = index_snapshot.iter().peekable();
+
+        while current_pos < file_len {
+            // --- INICIO DE VALIDACIÓN DE ÍNDICE ---
+            // Extraemos los datos del índice que necesitamos ANTES de la llamada mutable
+            let mut expected_offset = None;
+            let mut expected_ts = None;
+
+            if let Some(entry) = index_it.peek() {
+                if entry.row_number == row_counter {
+                    expected_offset = Some(entry.file_offset);
+                    expected_ts = Some(entry.timestamp);
+                    index_it.next(); // Avanzamos el iterador del clon
+                }
+            }
+            // --- FIN DE VALIDACIÓN DE ÍNDICE (el préstamo de index_it sobre el clon no afecta a self) ---
+
+            // Ahora self está libre para ser prestado como mutable
+            let (record, next_pos) = self.read_record_at(current_pos).map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "Falla determinista en fila {} (offset {}): {}",
+                        row_counter, current_pos, e
+                    ),
+                )
+            })?;
+
+            // Verificación cruzada con los datos extraídos
+            if let Some(off) = expected_offset {
+                if off != current_pos {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "Índice corrupto: Fila {} apunta a {}, real: {}",
+                            row_counter, off, current_pos
+                        ),
+                    ));
+                }
+            }
+
+            if let Some(ts) = expected_ts {
+                if ts != record.timestamp {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "Timestamp incoherente en fila {}: Índice {}, Real {}",
+                            row_counter, ts, record.timestamp
+                        ),
+                    ));
+                }
+            }
+
+            current_pos = next_pos;
+            row_counter += 1;
+        }
+
+        Ok(AuditReport {
+            total_records_found: row_counter,
+            total_bytes_processed: current_pos,
+            index_validation_count: index_snapshot.len(),
+            status: "Sincronía Determinista Perfecta".to_string(),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -833,7 +913,7 @@ mod tests {
 
     #[test]
     fn test_cursor_complete_universe() -> std::io::Result<()> {
-        let db_name: &str =  "complete_universe_test";
+        let db_name: &str = "complete_universe_test";
 
         let mut db = setup_db(db_name);
 
@@ -850,8 +930,7 @@ mod tests {
         for (i, p) in payloads.iter().enumerate() {
             // Obtenemos el tamaño del archivo directamente del sistema operativo
             // para saber exactamente dónde se escribirá el siguiente registro.
-            let offset_fisico =
-                std::fs::metadata(&format!("{}.cdb", db_name))?.len();
+            let offset_fisico = std::fs::metadata(&format!("{}.cdb", db_name))?.len();
             expected_offsets.push(offset_fisico);
 
             db.append(1000 + i as i64, p)?;
@@ -891,7 +970,6 @@ mod tests {
 
     #[test]
     fn test_cursor_persistence_and_recovery() -> std::io::Result<()> {
-
         let db_path = "pers_test.cdb";
         let idx_path = "pers_test.cdbi";
         let _ = fs::remove_file(db_path);
@@ -1200,6 +1278,111 @@ mod tests {
         let _ = fs::remove_file(format!("{}.cdb", db_name));
         let _ = fs::remove_file(format!("{}.cdbi", db_name));
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_verify_deterministic_integrity() -> std::io::Result<()> {
+        let data_path = "deterministic.cdb";
+        let index_path = "deterministic.cdbi";
+
+        // Limpieza previa
+        let _ = std::fs::remove_file(data_path);
+        let _ = std::fs::remove_file(index_path);
+
+        {
+            let mut db = CursorDB::open_or_create(data_path, index_path)?;
+            // Insertamos datos suficientes para cruzar el INDEX_STRIDE (1024)
+            for i in 0..1050 {
+                db.append(i as i64, b"datos_deterministas")?;
+            }
+
+            // 1. Verificar estado limpio
+            let report = db.verify_deterministic_integrity()?;
+            assert_eq!(report.total_records_found, 1050);
+            println!("✔ Fase 1: Datos limpios verificados.");
+        }
+
+        // 2. ESCENARIO: Corrupción de Bit (Bit Rot)
+        // Alteramos un solo byte en el cuerpo del archivo
+        {
+            let mut file = OpenOptions::new().write(true).open(data_path)?;
+            file.seek(SeekFrom::Start(5000))?; // Offset arbitrario
+            file.write_all(&[0xFF])?;
+        }
+
+        {
+            let mut db = CursorDB::open_or_create(data_path, index_path)?;
+            let result = db.verify_deterministic_integrity();
+            assert!(result.is_err(), "Debería detectar CRC inválido");
+            println!("✔ Fase 2: Bit Rot detectado correctamente.");
+        }
+
+        // 3. ESCENARIO: Índice mentiroso
+        // Restauramos el archivo y corrompemos el índice manualmente
+        let _ = std::fs::remove_file(data_path);
+        let _ = std::fs::remove_file(index_path);
+        {
+            let mut db = CursorDB::open_or_create(data_path, index_path)?;
+            db.append(100, b"dato1")?; // Fila 0
+            db.append(200, b"dato2")?; // Fila 1
+
+            // Forzamos un error de desfase:
+            // Cambiamos el offset del índice para que apunte a cualquier lugar menos al 0
+            db.index[0].file_offset = 500;
+
+            let result = db.verify_deterministic_integrity();
+            assert!(result.is_err(), "Debería fallar porque el índice miente");
+
+            if let Err(e) = result {
+                let msg = e.to_string();
+                println!("DEBUG: Error real detectado: {}", msg);
+                // Verificamos que sea un error de integridad o de datos inválidos
+                assert!(
+                    msg.contains("Falla determinista")
+                        || msg.contains("Índice corrupto")
+                        || msg.contains("Desfase")
+                );
+            }
+            println!("✔ Fase 3: Índice inconsistente detectado.");
+        }
+
+        // 4. ESCENARIO: Basura al final (Trailing Garbage)
+        {
+            let mut file = std::fs::OpenOptions::new().append(true).open(data_path)?;
+            file.write_all(b"basura")?;
+        }
+
+        // Intentamos abrir la DB.
+        // Si tu motor es determinista, debería fallar AQUÍ o en el audit.
+        let db_result = CursorDB::open_or_create(data_path, index_path);
+
+        match db_result {
+            // Caso A: El motor detectó la basura al intentar abrir (reconcile)
+            Err(e) => {
+                println!("✔ Fase 4: Éxito. El motor detectó basura al abrir: {}", e);
+                assert!(
+                    e.to_string().contains("Header incompleto") || e.to_string().contains("basura")
+                );
+            }
+            // Caso B: El motor abrió, pero la auditoría debe fallar
+            Ok(mut db) => {
+                let audit_result = db.verify_deterministic_integrity();
+                match audit_result {
+                    Err(e) => {
+                        println!("✔ Fase 4: Éxito. La auditoría detectó la basura: {}", e);
+                        assert!(
+                            e.to_string().contains("Header incompleto")
+                                || e.to_string().contains("basura")
+                        );
+                    }
+                    Ok(_) => panic!("Falla de Determinismo: El motor aceptó basura sin rechistar"),
+                }
+            }
+        }
+
+        let _ = fs::remove_file(format!("{}", data_path));
+        let _ = fs::remove_file(format!("{}", index_path));
         Ok(())
     }
 }
