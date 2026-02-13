@@ -1,19 +1,36 @@
 use cursor_db::cursor::CursorDB;
 use cursor_db::cursor::DBStats;
+use std::fs;
+use std::path::Path;
 use std::thread;
 use std::time::Duration;
 
 fn main() -> std::io::Result<()> {
-    // 1. Apertura con propagación de error '?'
+    // Definimos las rutas
+    let data_path = "data/data.cdb";
+    let index_path = "data/index.cdbi";
+
+    // 1. BORRAR ARCHIVOS PREVIOS (Clean Start)
+    // Usamos un pequeño closure para ignorar el error si el archivo no existe
+    for path in &[data_path, index_path] {
+        if Path::new(path).exists() {
+            fs::remove_file(path)?;
+            println!("Deleted old file: {}", path);
+        }
+    }
+
+    // Asegurarse de que el directorio existe
+    if let Some(parent) = Path::new(data_path).parent() {
+        fs::create_dir_all(parent)?;
+    }
+
     let mut db: CursorDB = CursorDB::open_or_create("data/data.cdb", "data/index.cdbi")?;
 
-    /*
-    for i in 0..1_000_000 {
+    for i in 0..20 {
         let timestamp = 1_000_000_000 + i;
         let payload = format!("payload-{}", i).into_bytes();
         db.append(timestamp, &payload)?;
     }
-    */
 
     thread::sleep(Duration::from_millis(500));
 
