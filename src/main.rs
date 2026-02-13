@@ -73,5 +73,16 @@ fn main() -> std::io::Result<()> {
         println!("Registro actual: {:?}", rec.timestamp);
     }
 
+    match db.move_to_last()? {
+        Some(record) => {
+            println!("Moved to last:   {}", record.timestamp);
+        }
+        None => println!("The database is empty."),
+    }
+
+    if let Some(rec) = db.current()? {
+        println!("Registro actual: {:?}", rec.timestamp);
+    }
+
     Ok(())
 }

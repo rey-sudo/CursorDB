@@ -316,23 +316,28 @@ impl CursorDB {
     }
 
     fn reconcile_total_rows(&mut self) -> std::io::Result<()> {
-        let file_len = self.data_file.metadata()?.len();
+        let file_len: u64 = self.data_file.metadata()?.len();
 
         // 1. EXTRAER DATOS PRIMERO (Copiamos los valores fuera de self)
         // Usamos .copied() o extraemos los campos manualmente para liberar el préstamo de self.index
-        let last_entry = self.index.last().map(|e| (e.row_number, e.file_offset));
+        let last_entry: Option<(u64, u64)> = self
+            .index
+            .last()
+            .map(|e: &IndexEntry| (e.row_number, e.file_offset));
 
-        let (mut row_count, mut current_off) = if let Some((row_num, offset)) = last_entry {
-            // Si el último registro del índice está corrupto, la apertura fallará con el motivo real.
-            let (_, next_off) = self.read_record_at(offset)?;
-
-            (row_num + 1, next_off)
-        } else {
-            (0, 0)
+        let (mut row_count, mut current_off, mut last_start_offset) = match last_entry {
+            Some((row_num, offset)) => {
+                // Validamos que el registro apuntado por el índice sea legible
+                let (_, next_off) = self.read_record_at(offset)?;
+                (row_num + 1, next_off, offset)
+            }
+            None => (0, 0, 0),
         };
 
         // 2. ESCANEO (Ya no hay conflictos de préstamo)
         while current_off < file_len {
+            last_start_offset = current_off;
+
             // Ya no necesitamos un 'else' manual para lanzar errores.
             // Si read_record_at encuentra un CRC inválido o un archivo truncado,
             // detendrá el bucle y saldrá de la función devolviendo ese error exacto.
@@ -341,9 +346,20 @@ impl CursorDB {
             current_off = next_off;
             row_count += 1;
         }
+
+        if current_off != file_len {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "Corruption detected: File has {} bytes of trailing garbage/incomplete data.",
+                    file_len - current_off
+                ),
+            ));
+        }
+
         // 3. ACTUALIZAR ESTADO
         self.total_rows = row_count;
-        self.last_valid_offset = current_off;
+        self.last_valid_offset = last_start_offset;
         self.current_row = 0;
         self.current_offset = 0;
 
@@ -362,7 +378,7 @@ impl CursorDB {
             ));
         }
 
-        let offset = self.data_file.seek(SeekFrom::End(0))?;
+        let offset: u64 = self.data_file.seek(SeekFrom::End(0))?;
 
         let mut hasher: Hasher = Hasher::new();
         hasher.update(payload);
@@ -393,9 +409,13 @@ impl CursorDB {
         }
 
         self.data_file.flush()?;
+        self.last_valid_offset = offset;
+
+        self.current_row = self.total_rows;
+        self.current_offset = offset;
 
         self.total_rows += 1;
-        self.last_valid_offset = self.data_file.seek(SeekFrom::Current(0))?;
+
         Ok(())
     }
 
@@ -539,6 +559,29 @@ impl CursorDB {
         self.current_offset = offset;
 
         self.current()
+    }
+
+    /// Positions the cursor at the last valid record and returns it.
+    pub fn move_to_last(&mut self) -> std::io::Result<Option<Record>> {
+        // Safety check: Return early if the database contains no records.
+        if self.total_rows == 0 {
+            return Ok(None);
+        }
+
+        // Use the pre-calculated offset of the last successful entry.
+        // This value is maintained during load, reconcile, and append operations.
+        let target_offset: u64 = self.last_valid_offset;
+
+        // Read the record from the data file.
+        // We ignore the second return value (next_offset) as we are already at the end.
+        let (record, _) = self.read_record_at(target_offset)?;
+
+        // 4. Update the internal cursor state.
+        // Since the Record struct doesn't store the ID, we derive it from total_rows.
+        self.current_row = self.total_rows - 1;
+        self.current_offset = target_offset;
+
+        Ok(Some(record))
     }
 
     pub fn move_cursor_at(&mut self, ts: i64) -> std::io::Result<Option<Record>> {
