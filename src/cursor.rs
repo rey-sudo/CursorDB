@@ -62,6 +62,8 @@ pub struct CursorDB {
     /// Points to the exact byte where the last valid record ends.
     /// Used by health checks (stats) to detect orphan data or corruption.
     last_valid_offset: u64,
+
+    data_path: String,
 }
 
 #[derive(Debug)]
@@ -165,6 +167,15 @@ impl CursorDB {
     pub fn current_offset(&self) -> u64 {
         self.current_offset
     }
+    #[cfg(test)]
+    pub fn clear_index_in_memory(&mut self) {
+        self.index.clear();
+    }
+
+    fn get_file_size(&self) -> std::io::Result<u64> {
+        Ok(std::fs::metadata(&self.data_path)?.len())
+    }
+
     /// Generates a snapshot of the database health and storage metrics.
     pub fn stats(&self) -> std::io::Result<DBStats> {
         let data_len: u64 = self.data_file.metadata()?.len();
@@ -245,6 +256,7 @@ impl CursorDB {
             current_offset: 0,
             total_rows: 0,
             last_valid_offset: 0,
+            data_path: data_path.to_string(),
         };
 
         db.load_index()?;
@@ -448,16 +460,12 @@ impl CursorDB {
     }
 
     pub fn current(&mut self) -> std::io::Result<Option<Record>> {
-        // Si no hay registros, no es un error, simplemente no hay nada que mostrar.
-        if self.total_rows == 0 {
+        // Si no hay registros o el cursor se pasó del final, devolvemos None sin leer el disco
+        if self.total_rows == 0 || self.current_row >= self.total_rows {
             return Ok(None);
         }
 
-        // Ahora el '?' de read_record_at funciona perfectamente porque
-        // la función devuelve Result.
-        // Si el registro está corrupto, el error sube al usuario.
         let (record, _) = self.read_record_at(self.current_offset)?;
-
         Ok(Some(record))
     }
 
@@ -623,10 +631,9 @@ impl CursorDB {
             return Ok(None);
         }
 
-        // Encontrar la última entrada de índice cuyo timestamp sea <= ts
+        // 1. Salto rápido: Encontrar la última entrada de índice cuyo timestamp sea <= ts
         let pos = self.index.partition_point(|e| e.timestamp <= ts);
         if pos == 0 {
-            // Si el TS es menor que el primer índice, empezamos desde el principio
             self.current_row = 0;
             self.current_offset = 0;
         } else {
@@ -635,22 +642,32 @@ impl CursorDB {
             self.current_offset = idx.file_offset;
         }
 
-        // Escaneo lineal hasta encontrar el timestamp exacto o el siguiente superior
+        // 2. Escaneo lineal estricto
         loop {
-            // El '?' captura fallos de lectura o corrupción en el proceso de búsqueda
             let (record, next_offset) = self.read_record_at(self.current_offset)?;
 
-            // Si encontramos el registro o nos pasamos (lo que significa que el TS exacto no existe)
-            if record.timestamp >= ts {
+            // COINCIDENCIA EXACTA: Actualizamos estado y devolvemos el registro
+            if record.timestamp == ts {
                 return Ok(Some(record));
             }
 
-            // Si llegamos al último registro de la base de datos sin encontrar un TS >= ts
-            if self.current_row + 1 >= self.total_rows {
+            // CASO A: Nos pasamos del timestamp (no existe en el archivo ordenado)
+            if record.timestamp > ts {
+                self.current_row = self.total_rows;
+                // Calculamos el final del archivo o simplemente usamos el offset del siguiente
+                // para indicar que estamos fuera de rango.
+                self.current_offset = self.get_file_size()?;
                 return Ok(None);
             }
 
-            // Avanzamos el cursor interno
+            // CASO B: Llegamos al último registro sin encontrar el timestamp
+            if self.current_row + 1 >= self.total_rows {
+                self.current_row = self.total_rows;
+                self.current_offset = next_offset; // Este ya es el final físico (EOF)
+                return Ok(None);
+            }
+
+            // Avanzamos el cursor interno para la siguiente iteración
             self.current_offset = next_offset;
             self.current_row += 1;
         }
@@ -713,106 +730,274 @@ mod tests {
     use std::fs;
     use std::io::Write;
 
-    // Utilidad para limpiar y crear una DB de prueba
-    fn setup_test_db(data_path: &str, index_path: &str) -> CursorDB {
-        let _ = fs::remove_file(data_path);
-        let _ = fs::remove_file(index_path);
-        CursorDB::open_or_create(data_path, index_path).unwrap()
+    fn setup_db(name: &str) -> CursorDB {
+        let d = format!("{}.cdb", name);
+        let i = format!("{}.cdbi", name);
+        let _ = fs::remove_file(&d);
+        let _ = fs::remove_file(&i);
+        CursorDB::open_or_create(&d, &i).expect("Error al crear DB de test")
     }
 
     #[test]
-    fn test_exhaustive_cursor_navigation() -> std::io::Result<()> {
-        let data_p = "test_nav.cdb";
-        let index_p = "test_nav.cdbi";
-        let mut db = setup_test_db(data_p, index_p);
+    fn test_cursor_logical_consistency() -> std::io::Result<()> {
+        let mut db = setup_db("logical_test");
 
-        // 1. CASO: DB VACÍA
-        assert!(db.next()?.is_none(), "Next en DB vacía debe ser None");
-        assert!(db.back()?.is_none(), "Back en DB vacía debe ser None");
-        assert!(db.current()?.is_none(), "Current en DB vacía debe ser None");
-
-        // 2. CASO: INSERCIÓN Y NAVEGACIÓN SECUENCIAL
-        // Insertamos 5 registros
-        for i in 0..5 {
-            db.append(1000 + i as i64, format!("data-{}", i).as_bytes())?;
+        // 1. Inserción masiva para forzar creación de varios índices
+        // Con INDEX_STRIDE = 1024, insertamos 3000 registros
+        let total_to_insert = 3000;
+        for i in 0..total_to_insert {
+            db.append(1000 + i as i64, format!("payload-{}", i).as_bytes())?;
         }
 
-        // Resetear cursor al inicio para probar next()
-        db.current_row = 0;
-        db.current_offset = 0;
+        // 2. Verificación de Límite Superior (Next)
+        db.move_to_last()?;
+        let last_row = db.current_row();
+        assert_eq!(last_row, (total_to_insert - 1) as u64);
 
-        for i in 0..5 {
-            assert_eq!(db.current_row(), i as u64);
-            let rec = db.next()?.expect("Debe existir registro");
-            assert_eq!(rec.timestamp, 1000 + i as i64);
-        }
+        let last_rec = db.next()?.unwrap();
+        assert_eq!(last_rec.timestamp, 1000 + (total_to_insert - 1) as i64);
+        assert!(db.next()?.is_none(), "Debería ser None después del último");
 
-        // El cursor ahora debe estar en total_rows (5) y devolver None
-        assert_eq!(db.current_row(), 5);
-        assert!(db.next()?.is_none(), "Next al final debe ser None");
-
-        // 3. CASO: BACK (Retroceso)
-        // Estamos en el 5 (después del último). Back() debería llevarnos al 4.
-        let rec_4 = db
+        // 3. Verificación de Simetría (Next -> Back)
+        // Si estamos al final (None), back() debería devolver el último registro (2999)
+        let back_rec = db
             .back()?
-            .expect("Back desde el final debe dar el registro 4");
-        assert_eq!(rec_4.timestamp, 1004);
-        assert_eq!(db.current_row(), 4);
+            .expect("Back desde EOF debe devolver el último registro");
+        assert_eq!(back_rec.timestamp, 1000 + 2999);
+        assert_eq!(db.current_row(), 2999);
 
-        // Retroceder hasta el inicio
-        while db.current_row() > 0 {
-            db.back()?;
-        }
+        // 4. Verificación de Salto de Índice (Cruzar fronteras de INDEX_STRIDE)
+        // Saltamos al registro 2000 (que está después del segundo marcador de índice)
+        db.move_cursor_at(1000 + 2000)?;
+        assert_eq!(db.current_row(), 2000);
+
+        // Retroceder un paso debería llevarnos al 1999
+        let prev = db.back()?.unwrap();
+        assert_eq!(prev.timestamp, 1000 + 1999);
+        assert_eq!(db.current_row(), 1999);
+
+        // 5. Verificación de Límite Inferior (Fila 0)
+        db.move_cursor_at(1000)?; // Ir al inicio
         assert_eq!(db.current_row(), 0);
-        assert!(db.back()?.is_none(), "Back en la fila 0 debe ser None");
+        assert!(db.back()?.is_none(), "Back desde la fila 0 debe ser None");
 
-        // 4. CASO: MOVE_TO_LAST
-        let last = db.move_to_last()?.expect("Debe ir al último");
-        assert_eq!(last.timestamp, 1004);
-        assert_eq!(db.current_row(), 4);
+        // El cursor debe seguir en 0 después del None
+        assert_eq!(db.current_row(), 0);
+        let first = db.current()?.unwrap();
+        assert_eq!(first.timestamp, 1000);
 
-        // 5. CASO: BÚSQUEDA POR TIMESTAMP (move_cursor_at)
-        // Buscar exacto
-        let found = db.move_cursor_at(1002)?.expect("Debe hallar TS 1002");
-        assert_eq!(found.timestamp, 1002);
-        assert_eq!(db.current_row(), 2);
-
-        // Buscar uno que no existe (debe devolver el siguiente superior)
-        let found_closest = db.move_cursor_at(1002)?.expect("Debe hallar");
-        assert_eq!(found_closest.timestamp, 1002);
-
-        // Buscar uno mayor al máximo
-        assert!(
-            db.move_cursor_at(9999)?.is_none(),
-            "TS fuera de rango debe ser None"
-        );
-
-        fs::remove_file(data_p)?;
-        fs::remove_file(index_p)?;
         Ok(())
     }
 
     #[test]
-    fn test_persistence_and_reconcile() -> std::io::Result<()> {
-        let data_p = "test_persist.cdb";
-        let index_p = "test_persist.cdbi";
-
-        // Escribir y cerrar
-        {
-            let mut db = setup_test_db(data_p, index_p);
-            db.append(500, b"Persist me")?;
-            db.append(600, b"Me too")?;
+    fn test_deterministic_cursor_boundaries() -> std::io::Result<()> {
+        let mut db = setup_db("boundary_test");
+        // Insertamos 10 registros (0 al 9)
+        for i in 0..10 {
+            db.append(i as i64, format!("p-{}", i).as_bytes())?;
         }
 
-        // Reabrir: Aquí se dispara load_index y reconcile_total_rows
-        let mut db = CursorDB::open_or_create(data_p, index_p)?;
-        assert_eq!(db.total_rows(), 2);
+        // --- ESCENARIO 1: UNDERFLOW EN RANGOS ---
+        db.move_cursor_at(2)?; // Estamos en la fila 2
+        // Pedimos 5 antes y 5 después.
+        // Debe limitarse automáticamente a [0, 7] sin crashear.
+        let range = db.range_around_cursor(5, 5)?;
+        assert_eq!(range.len(), 8); // Filas: 0, 1, 2, 3, 4, 5, 6, 7
+        assert_eq!(range[0].timestamp, 0);
 
-        let first = db.next()?.unwrap();
-        assert_eq!(first.timestamp, 500);
+        // --- ESCENARIO 2: RE-ENTRADA DESDE EL FINAL ---
+        db.move_to_last()?; // Fila 9
+        db.next()?; // Cursor ahora en Fila 10 (EOF)
+        assert!(db.current()?.is_none());
 
-        fs::remove_file(data_p)?;
-        fs::remove_file(index_p)?;
+        // ¿Puede volver al archivo?
+        let back_to_9 = db.back()?.expect("Debe poder volver desde EOF");
+        assert_eq!(back_to_9.timestamp, 9);
+        assert_eq!(db.current_row(), 9);
+
+        // --- ESCENARIO 3: SALTOS DISCONTINUOS ---
+        // Saltar del final al principio y viceversa
+        db.move_cursor_at(0)?;
+        assert_eq!(db.current_row(), 0);
+        db.move_to_last()?;
+        assert_eq!(db.current_row(), 9);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_cursor_complete_universe() -> std::io::Result<()> {
+        let mut db = setup_db("complete_universe_test");
+
+        let payloads = vec![
+            vec![1u8; 10],   // Fila 0
+            vec![2u8; 1000], // Fila 1
+            vec![3u8; 0],    // Fila 2
+            vec![4u8; 50],   // Fila 3
+        ];
+
+        let mut expected_offsets = Vec::new();
+
+        // --- FASE DE ESCRITURA ---
+        for (i, p) in payloads.iter().enumerate() {
+            // Obtenemos el tamaño del archivo directamente del sistema operativo
+            // para saber exactamente dónde se escribirá el siguiente registro.
+            let offset_fisico =
+                std::fs::metadata(&format!("{}.cdb", "complete_universe_test"))?.len();
+            expected_offsets.push(offset_fisico);
+
+            db.append(1000 + i as i64, p)?;
+            println!("LOG: Fila {} escrita en offset físico {}", i, offset_fisico);
+        }
+
+        // --- FASE DE RETROCESO ---
+        db.move_to_last()?;
+        db.next()?; // Saltamos al EOF (Fila 4)
+
+        for i in (0..payloads.len()).rev() {
+            let rec = db.back()?.expect("Debe existir registro al retroceder");
+
+            let actual_row = db.current_row();
+            let actual_offset = db.current_offset();
+
+            println!(
+                "Validando Fila {}: Actual [Row: {}, Offset: {}], Esperado Offset: {}",
+                i, actual_row, actual_offset, expected_offsets[i]
+            );
+
+            assert_eq!(actual_row, i as u64, "Error en número de fila");
+            assert_eq!(
+                actual_offset, expected_offsets[i],
+                "Error en offset: el cursor no aterrizó en el inicio del header"
+            );
+            assert_eq!(rec.timestamp, 1000 + i as i64, "Datos corruptos");
+        }
+
+        // Límite BOF
+        assert!(db.back()?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn test_cursor_persistence_and_recovery() -> std::io::Result<()> {
+        let db_path = "pers_test.cdb";
+        let idx_path = "pers_test.cdbi";
+        let _ = fs::remove_file(db_path);
+        let _ = fs::remove_file(idx_path);
+
+        // 1. Sesión A: Escribir datos y crear índice
+        {
+            let mut db = CursorDB::open_or_create(db_path, idx_path)?;
+            for i in 0..2000 {
+                db.append(2000 + i as i64, b"payload")?;
+            }
+            // Al cerrarse aquí, el índice se guarda en disco
+        }
+
+        // 2. Sesión B: Abrir y verificar navegación atrás
+        {
+            let mut db = CursorDB::open_or_create(db_path, idx_path)?;
+
+            // El total de filas debe ser 2000
+            assert_eq!(db.total_rows(), 2000);
+
+            // Ir al final y retroceder para forzar el uso del índice cargado de disco
+            db.move_to_last()?;
+            for i in (1990..2000).rev() {
+                let rec = db.current()?.unwrap();
+                assert_eq!(rec.timestamp, 2000 + i as i64);
+                db.back()?;
+            }
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_cursor_ultimate_robustness() -> std::io::Result<()> {
+        let db_name = "ultimate_robust_test";
+        let mut db = setup_db(db_name);
+
+        // --- 1. PREPARACIÓN: Insertamos 1500 registros ---
+        // Usamos timestamps pares (1000, 1002, 1004...) para probar búsquedas de impares
+        for i in 0..1500 {
+            db.append(1000 + (i * 2) as i64, b"payload")?;
+        }
+
+        // --- 2. TEST DE PERSISTENCIA Y CARGA ---
+        // Cerramos y reabrimos para forzar la carga del índice desde el disco (.cdbi)
+        drop(db);
+        let mut db =
+            CursorDB::open_or_create(&format!("{}.cdb", db_name), &format!("{}.cdbi", db_name))?;
+        assert_eq!(
+            db.total_rows, 1500,
+            "La persistencia falló al recuperar el conteo de filas"
+        );
+
+        // --- 3. TEST DE NAVEGACIÓN HACIA ATRÁS (BACK) ---
+        db.move_to_last()?;
+        let rec = db.current()?.unwrap();
+        assert_eq!(rec.timestamp, 1000 + (1499 * 2) as i64);
+
+        // Retrocedemos 5 pasos
+        for _ in 0..5 {
+            db.back()?;
+        }
+        assert_eq!(db.current()?.unwrap().timestamp, 1000 + (1494 * 2) as i64);
+
+        // --- 4. TEST DE ÍNDICE MUTILADO (FALLBACK) ---
+        // Borramos el índice de la memoria. back() ahora debe usar escaneo lineal desde 0.
+        db.clear_index_in_memory();
+        let rec_fallback = db
+            .back()?
+            .expect("Back debe funcionar mediante escaneo lineal si no hay índice");
+        assert_eq!(rec_fallback.timestamp, 1000 + (1493 * 2) as i64);
+
+        // --- 5. TEST DE BÚSQUEDA (MOVE_CURSOR_AT) ---
+
+        // CASO A: Timestamp exacto
+        let found = db.move_cursor_at(1100)?; // 1000 + (50 * 2)
+        assert!(found.is_some());
+        assert_eq!(db.current_row, 50);
+
+        // CASO B: Timestamp inexistente (hueco entre registros)
+        // Buscamos 1101, pero solo existen 1100 y 1102. Debe devolver None y mover a EOF.
+        let missing_gap = db.move_cursor_at(1101)?;
+        assert!(
+            missing_gap.is_none(),
+            "Debe ser None porque el TS 1101 no existe"
+        );
+        assert_eq!(
+            db.current_row, 1500,
+            "El cursor debe quedar en el EOF tras búsqueda fallida"
+        );
+
+        // CASO C: Timestamp inexistente (pasado lejano)
+        let missing_past = db.move_cursor_at(500)?;
+        assert!(missing_past.is_none());
+        assert_eq!(
+            db.current_row, 1500,
+            "Búsqueda en el pasado fallida debe llevar al EOF"
+        );
+
+        // CASO D: Timestamp inexistente (futuro lejano)
+        let missing_future = db.move_cursor_at(9999)?;
+        assert!(missing_future.is_none());
+        assert_eq!(
+            db.current_row, 1500,
+            "Búsqueda en el futuro fallida debe llevar al EOF"
+        );
+
+        // --- 6. RECUPERACIÓN TRAS FALLO ---
+        // Verificamos que tras un fallo de búsqueda, back() puede traernos de vuelta al último registro
+        let rescue = db
+            .back()?
+            .expect("Back debe poder rescatar al cursor del EOF");
+        assert_eq!(rescue.timestamp, 1000 + (1499 * 2) as i64);
+
+        // Limpieza
+        fs::remove_file(format!("{}.cdb", db_name))?;
+        fs::remove_file(format!("{}.cdbi", db_name))?;
         Ok(())
     }
 }
