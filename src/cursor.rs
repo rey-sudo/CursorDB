@@ -1000,4 +1000,119 @@ mod tests {
         fs::remove_file(format!("{}.cdbi", db_name))?;
         Ok(())
     }
+
+    #[test]
+    fn test_cursor_stride_boundaries() -> std::io::Result<()> {
+        let mut db = setup_db("stride_test");
+        let stride = 1024; // Asumiendo que tu constante es esta
+
+        // 1. Insertamos justo hasta el límite del primer salto de índice
+        for i in 0..=stride {
+            db.append(2000 + i as i64, b"test")?;
+        }
+
+        // 2. Probamos que el salto al registro indexado (1023)
+        // y al no indexado (1024) funciona perfectamente.
+        db.move_cursor_at(2000 + stride as i64)?;
+        assert_eq!(db.current_row(), stride as u64);
+
+        db.back()?;
+        assert_eq!(db.current_row(), (stride - 1) as u64);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_cursor_exhaustive_traversal() -> std::io::Result<()> {
+        let mut db = setup_db("exhaustive_test");
+
+        for i in 1..=10 {
+            db.append((i * 10) as i64, format!("data_{}", i).as_bytes())?;
+        }
+
+        // --- IDA: Hasta el final ---
+        db.move_cursor_at(10)?;
+        for i in 0..10 {
+            assert_eq!(db.current_row, i as u64, "Error de fila en avance");
+            if i < 9 {
+                db.next()?;
+            }
+        }
+
+        // Forzamos EOF
+        db.next()?;
+        assert_eq!(db.current_row, 10, "Debe estar en la fila 10 (EOF)");
+
+        // --- VUELTA: Hasta el inicio real ---
+        // El primer back() nos lleva de la 10 (EOF) a la 9.
+        // Los siguientes 9 back() nos llevan de la 9 a la 0.
+        for i in (0..10).rev() {
+            let rec = db.back()?.expect("Debe poder retroceder");
+            assert_eq!(db.current_row, i as u64, "Error de fila en retroceso");
+            assert_eq!(rec.timestamp, ((i + 1) * 10) as i64);
+        }
+
+        // --- LA PRUEBA DE FUEGO ---
+        // Ahora estamos REALMENTE en la fila 0.
+        let final_back = db.back()?;
+        assert!(
+            final_back.is_none(),
+            "Back desde la fila 0 DEBE devolver None"
+        );
+        assert_eq!(db.current_row, 0, "El cursor no debe moverse de 0");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_cursor_resilience_to_truncation() -> std::io::Result<()> {
+        let db_name = "resilience_test";
+        let mut db = setup_db(db_name);
+
+        // 1. Insertamos 10 registros (cada uno ocupa 20 bytes: 16 header + 4 data)
+        for i in 1..=10 {
+            db.append(i as i64, b"data")?;
+        }
+
+        // 2. Truncamos el archivo a la mitad (50 bytes)
+        // Esto deja 2 registros perfectos (40 bytes) y el 3ero mutilado (solo 10 bytes de header)
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(format!("{}.cdb", db_name))?;
+        file.set_len(50)?;
+        drop(file);
+
+        // --- ESCENARIO A: Intentar leer el registro dañado ---
+        // Intentamos buscar el registro 8. El índice nos mandará a un offset que ya no existe o está incompleto.
+        let result = db.move_cursor_at(8);
+
+        // Validamos que NO hubo pánico, sino un error controlado
+        assert!(
+            result.is_err(),
+            "La DB debería haber detectado que el registro está incompleto"
+        );
+
+        if let Err(e) = result {
+            assert_eq!(e.kind(), std::io::ErrorKind::InvalidData);
+            println!(
+                "Resiliencia confirmada: Error detectado correctamente -> {}",
+                e
+            );
+        }
+
+        // --- ESCENARIO B: Recuperación ---
+        // Probamos que el cursor puede volver a una zona segura (registro 1)
+        let recovered = db.move_cursor_at(1)?;
+        assert!(recovered.is_some());
+        assert_eq!(
+            recovered.unwrap().timestamp,
+            1,
+            "La DB debe poder recuperarse y leer zonas sanas"
+        );
+
+        // Limpieza
+        let _ = fs::remove_file(format!("{}.cdb", db_name));
+        let _ = fs::remove_file(format!("{}.cdbi", db_name));
+        Ok(())
+    }
 }
