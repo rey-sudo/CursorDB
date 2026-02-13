@@ -7,8 +7,8 @@ use std::time::Duration;
 
 fn main() -> std::io::Result<()> {
     // Definimos las rutas
-    let data_path = "data/data.cdb";
-    let index_path = "data/index.cdbi";
+    let data_path: &str = "data/data.cdb";
+    let index_path: &str = "data/index.cdbi";
 
     // 1. BORRAR ARCHIVOS PREVIOS (Clean Start)
     // Usamos un pequeño closure para ignorar el error si el archivo no existe
@@ -24,6 +24,7 @@ fn main() -> std::io::Result<()> {
         fs::create_dir_all(parent)?;
     }
 
+    //==================================================================
     let mut db: CursorDB = CursorDB::open_or_create("data/data.cdb", "data/index.cdbi")?;
 
     for i in 0..20 {
@@ -40,28 +41,34 @@ fn main() -> std::io::Result<()> {
     match db.move_cursor_at(0)? {
         // El '?' maneja el error de disco/CRC
         Some(r) => println!("Encontrado: {}", r.timestamp),
-        None => println!("Timestamp fuera de rango"),
+        None => {
+            println!("Timestamp fuera de rango moviendo a first");
+            db.move_to_first()?;
+        }
     }
 
-    // Ejemplo usando if let para un flujo más limpio
+    //=========================================================================
+
     if let Some(r) = db.back()? {
         println!("Anterior: {}", r.timestamp);
     } else {
         println!("Ya estás en el inicio.");
     }
 
-    // Actualizamos el acceso al registro actual
     if let Some(rec) = db.current()? {
         println!("Registro actual: {:?}", rec.timestamp);
     }
 
-    // --- NAVEGACIÓN ---
     if let Some(r) = db.next()? {
         println!("Siguiente: {}", r.timestamp);
     }
 
-    // --- RANGOS ---
-    // range_around_cursor ahora devuelve Result<Vec<Record>>
+    if let Some(rec) = db.current()? {
+        println!("Registro actual: {:?}", rec.timestamp);
+    }
+
+    //=========================================================================
+
     let logs = db.range_around_cursor(10, 10)?;
     if logs.is_empty() {
         println!("No se encontraron registros en el rango.");
@@ -69,10 +76,13 @@ fn main() -> std::io::Result<()> {
         println!("Ventana de {} registros obtenida.", logs.len());
     }
 
-    // --- BUCLE DE ITERACIÓN SEGURO ---
-    println!("--- Iniciando iteración de prueba ---");
-    db.move_cursor_at(0)?;
-    let mut count = 0;
+    //=========================================================================
+
+    if let Some(rec) = db.move_to_first()? {
+        println!("Moviendo first: {:?}", rec.timestamp);
+    }
+
+    let mut count: i32 = 0;
 
     // Este bucle se detiene si llegamos al final (Ok(None))
     // pero lanza error si hay corrupción (Err)
@@ -91,10 +101,8 @@ fn main() -> std::io::Result<()> {
     }
 
     match db.move_to_last()? {
-        Some(record) => {
-            println!("Moved to last:   {}", record.timestamp);
-        }
-        None => println!("The database is empty."),
+        Some(record) => println!("Moved to last:   {}", record.timestamp),
+        None => println!("Database empty"),
     }
 
     if let Some(rec) = db.current()? {

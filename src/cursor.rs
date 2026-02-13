@@ -606,6 +606,32 @@ impl CursorDB {
         self.current()
     }
 
+    /// Positions the cursor at the very first record and returns it.
+    pub fn move_to_first(&mut self) -> std::io::Result<Option<Record>> {
+        // Safety check: Si no hay registros, no hay nada que leer.
+        if self.total_rows == 0 {
+            return Ok(None);
+        }
+
+        // En este motor, el kilómetro cero es el offset 0.
+        let target_offset: u64 = 0;
+
+        // Leemos el registro en la posición inicial.
+        // next_off nos servirá para dejar el cursor listo para el siguiente next().
+        let (record, _) = self.read_record_at(target_offset)?;
+
+        // Actualizamos el estado interno al primer registro.
+        self.current_row = 0;
+        self.current_offset = target_offset;
+
+        println!(
+            "DEBUG: Moviendo a row {} en offset {}",
+            self.current_row, self.current_offset
+        );
+
+        Ok(Some(record))
+    }
+
     /// Positions the cursor at the last valid record and returns it.
     pub fn move_to_last(&mut self) -> std::io::Result<Option<Record>> {
         // Safety check: Return early if the database contains no records.
@@ -661,10 +687,6 @@ impl CursorDB {
 
             // CASO A: Nos pasamos del timestamp (no existe en el archivo ordenado)
             if record.timestamp > ts {
-                self.current_row = self.total_rows;
-                // Calculamos el final del archivo o simplemente usamos el offset del siguiente
-                // para indicar que estamos fuera de rango.
-                self.current_offset = self.get_file_size()?;
                 return Ok(None);
             }
 
