@@ -728,7 +728,6 @@ impl CursorDB {
 mod tests {
     use super::*;
     use std::fs;
-    use std::io::Write;
 
     fn setup_db(name: &str) -> CursorDB {
         let d = format!("{}.cdb", name);
@@ -1176,6 +1175,7 @@ mod tests {
         // Limpieza
         let _ = fs::remove_file(format!("{}.cdb", db_name));
         let _ = fs::remove_file(format!("{}.cdbi", db_name));
+        
         Ok(())
     }
 }
