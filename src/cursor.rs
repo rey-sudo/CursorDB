@@ -1,5 +1,6 @@
 use crate::record::Record;
 use crc32fast::Hasher;
+use std::collections::HashSet;
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -142,6 +143,12 @@ impl fmt::Display for DBStats {
             "Avg Record Size",
             Self::format_bytes(self.average_record_size)
         )?;
+        writeln!(
+            f,
+            "{:<22}: {}",
+            "Orphan Data Ratio",
+            self.orphan_data_ratio
+        )?;        
         writeln!(f, "{}", "━".repeat(35))?;
 
         if self.orphan_data_ratio > 0.0 {
@@ -180,12 +187,50 @@ impl CursorDB {
         self.index.clear();
     }
 
-    fn get_file_size(&self) -> std::io::Result<u64> {
-        Ok(std::fs::metadata(&self.data_path)?.len())
+    pub fn calculate_orphan_data_ratio(&mut self) -> std::io::Result<f64> {
+        let file_len = self.data_file.metadata()?.len();
+        if file_len == 0 {
+            return Ok(0.0);
+        }
+
+        // 1. Calculamos cuánto espacio ocupan los registros que SÍ conocemos
+        // Para esto, recorremos el archivo sumando el tamaño de cada registro
+        // hasta llegar a 'total_rows'.
+
+        let original_pos = self.data_file.stream_position()?;
+        let mut current_pos = 0u64;
+        let mut valid_bytes = 0u64;
+        let mut rows_processed = 0u64;
+
+        // Escaneamos solo hasta la cantidad de filas que el motor sabe que existen
+        while rows_processed < self.total_rows && current_pos + 16 <= file_len {
+            self.data_file.seek(SeekFrom::Start(current_pos))?;
+
+            let mut header = [0u8; 16];
+            if self.data_file.read_exact(&mut header).is_err() {
+                break;
+            }
+
+            let payload_size = u32::from_le_bytes(header[8..12].try_into().unwrap()) as u64;
+            let record_total_size = 16 + payload_size;
+
+            valid_bytes += record_total_size;
+            current_pos += record_total_size;
+            rows_processed += 1;
+        }
+
+        // Restauramos el cursor
+        self.data_file.seek(SeekFrom::Start(original_pos))?;
+
+        // 2. Lo que sobra después del último registro válido es "basura" o "incompleto"
+        let orphan_bytes = file_len.saturating_sub(valid_bytes);
+
+        let ratio = (orphan_bytes as f64 / file_len as f64) * 100.0;
+        Ok(ratio)
     }
 
     /// Generates a snapshot of the database health and storage metrics.
-    pub fn stats(&self) -> std::io::Result<DBStats> {
+    pub fn stats(&mut self) -> std::io::Result<DBStats> {
         let data_len: u64 = self.data_file.metadata()?.len();
         let index_len: usize = self.index.len();
 
@@ -198,17 +243,7 @@ impl CursorDB {
             self.last_valid_offset / entries as u64
         };
 
-        let orphan_bytes: u64 = if data_len > self.last_valid_offset {
-            data_len - self.last_valid_offset
-        } else {
-            0
-        };
-
-        let orphan_data_ratio: f64 = if data_len > 0 {
-            (orphan_bytes as f64 / data_len as f64) * 100.0
-        } else {
-            0.0
-        };
+        let orphan_data_ratio: f64 = self.calculate_orphan_data_ratio()?;
 
         Ok(DBStats {
             total_records: self.total_rows,
