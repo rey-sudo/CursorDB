@@ -235,7 +235,7 @@ impl CursorDB {
         let data_len: u64 = self.data_file.metadata()?.len();
         let index_len: usize = self.index.len();
 
-        let entries = self.index.len();
+        let entries: usize = self.index.len();
 
         let index_interval_bytes = if entries == 0 {
             0
@@ -282,10 +282,9 @@ impl CursorDB {
 
             // Extract the parent directory from the provided path
             if let Some(parent) = path.parent() {
-                // Only attempt to create directories if the path isn't just a filename
-                // (i.e., it actually contains a folder structure)
+                // Skip if the path is just a filename (parent would be an empty string)
                 if !parent.as_os_str().is_empty() {
-                    // Recursively create all missing directories in the path
+                    // Recursively create all missing parent directories (similar to 'mkdir -p')
                     fs::create_dir_all(parent)?;
                 }
             }
@@ -461,13 +460,13 @@ impl CursorDB {
                 ));
             }
 
-            let mut hasher = Hasher::new();
+            let mut hasher: Hasher = Hasher::new();
             hasher.update(payload);
-            let checksum = hasher.finalize();
+            let checksum: u32 = hasher.finalize();
 
             // Escribir en Data File
             self.data_file.write_all(&timestamp.to_le_bytes())?;
-            let size = payload.len() as u32;
+            let size: u32 = payload.len() as u32;
             self.data_file.write_all(&size.to_le_bytes())?;
             self.data_file.write_all(&checksum.to_le_bytes())?;
             self.data_file.write_all(payload)?;
@@ -475,7 +474,7 @@ impl CursorDB {
 
             // Lógica de Índice
             if self.total_rows % INDEX_STRIDE == 0 {
-                let entry = IndexEntry {
+                let entry: IndexEntry = IndexEntry {
                     row_number: self.total_rows,
                     timestamp,
                     file_offset: initial_data_size,
@@ -491,35 +490,28 @@ impl CursorDB {
             Ok(())
         })();
 
-        // 3. GESTIÓN DE RESULTADO (COMMIT O ROLLBACK)
         match write_result {
             Ok(_) => {
-                // COMMIT: La escritura fue exitosa, actualizamos estado en RAM
+                // COMMIT: Update RAM state only after successful disk write
                 self.last_valid_offset = initial_data_size;
-
                 self.total_rows += 1;
-                self.current_row = self.total_rows - 1;
+
+                // Point the cursor to the record we just wrote
+                self.current_row = self.total_rows.saturating_sub(1);
                 self.current_offset = initial_data_size;
 
                 Ok(())
             }
             Err(e) => {
-                // ROLLBACK: Algo falló, limpiamos los archivos para evitar corrupción
-
-                // Truncar archivo de datos al tamaño original
+                // ROLLBACK: Revert files to original size to maintain integrity
                 self.data_file.set_len(initial_data_size)?;
-                self.data_file.seek(SeekFrom::Start(initial_data_size))?;
-
-                // Truncar archivo de índice al tamaño original
                 self.index_file.set_len(initial_index_size)?;
-                self.index_file.seek(SeekFrom::Start(initial_index_size))?;
 
-                // Revertir el vector de índice en RAM si se alcanzó a pushear
                 if self.index.len() > initial_index_len {
                     self.index.pop();
                 }
 
-                Err(e) // Devolvemos el error original para que el usuario sepa que falló
+                Err(e)
             }
         }
     }
@@ -758,11 +750,6 @@ impl CursorDB {
         self.current_offset = self.last_valid_offset;
         self.current_row = self.total_rows - 1;
 
-        println!(
-            "DEBUG: Moviendo a row {} en offset {}",
-            self.current_row, self.current_offset
-        );
-
         Ok(Some(record))
     }
 
@@ -816,7 +803,7 @@ impl CursorDB {
 
     fn execute_range_scan(&mut self, before: u64, after: u64) -> std::io::Result<Vec<Record>> {
         let start_row = self.current_row.saturating_sub(before);
-        let end_row = (self.current_row + after).min(self.total_rows - 1);
+        let end_row = (self.current_row + after).min(self.total_rows.saturating_sub(1));
 
         // 1. Localizar punto de inicio en el índice
         let pos = self.index.partition_point(|e| e.row_number <= start_row);
@@ -827,10 +814,22 @@ impl CursorDB {
             (idx.row_number, idx.file_offset)
         };
 
-        let mut results = Vec::with_capacity((before + after + 1) as usize);
+        let expected_size: usize = (end_row - start_row + 1) as usize;
+        let mut results: Vec<Record> = Vec::with_capacity(expected_size);
+
+        let file_size = self.data_file.metadata()?.len();
 
         // 2. Escaneo lineal con validación
         while row <= end_row {
+            if offset >= file_size {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!(
+                        "Database drift: expected row {}, but reached EOF at offset {}",
+                        row, offset
+                    ),
+                ));
+            }
             // El '?' detiene el escaneo si hay un error de CRC o lectura
             let (record, next_offset) = self.read_record_at(offset)?;
 

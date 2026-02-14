@@ -1,19 +1,44 @@
 use cursor_db::cursor::CursorDB;
 use cursor_db::cursor::DBStats;
+use std::fs;
+use std::path::Path;
 
 fn main() -> std::io::Result<()> {
     // Define file paths
     let data_path: &str = "../data/data.cdb";
     let index_path: &str = "../data/index.cdbi";
 
+    for path in &[data_path, index_path] {
+        if Path::new(path).exists() {
+            fs::remove_file(path)?;
+            println!("Deleted previous file: {}", path);
+        }
+    }
+
+    //=========================================================================
+    
     // Create database
     let mut db: CursorDB = CursorDB::open_or_create(data_path, index_path)?;
 
+    let total_records: i64 = 20;
+
     // Create records
-    for i in 0..20 {
+    for i in 0..total_records {
         let timestamp: i64 = 1_000_000_000 + i;
         let payload: Vec<u8> = format!("payload-{}", i).into_bytes();
-        db.append(timestamp, &payload)?;
+
+        match db.exists(timestamp) {
+            Ok(true) => {
+                println!("🗙 Already exists: {}", timestamp);
+            }
+            Ok(false) => {
+                db.append(timestamp, &payload)?;
+                println!("✔ New Record Saved: {}", timestamp);
+            }
+            Err(e) => {
+                eprintln!("🗙 Error checking existence: {}", e);
+            }
+        }
     }
 
     //Display stats
@@ -27,98 +52,105 @@ fn main() -> std::io::Result<()> {
             println!("Current position: {:?}", rec.timestamp);
         }
         Ok(None) => {
-            println!("The position does not exist");
+            println!("Current position does not exist");
         }
         Err(e) => {
-            eprintln!("Error: {}", e);
+            eprintln!("Current error: {}", e);
         }
     }
 
     //=========================================================================
 
-    match db.move_cursor_at(0)? {
-        Some(r) => println!("Encontrado: {}", r.timestamp),
-        None => {
-            println!("Timestamp fuera de rango moviendo a first");
-            db.move_to_first()?;
+    let ts_0: i64 = 3;
+
+    match db.move_cursor_at(ts_0) {
+        Ok(Some(r)) => {
+            println!("Position found: {}", r.timestamp);
+        }
+
+        Ok(None) => {
+            println!("Position not found: {}", ts_0);
+        }
+
+        Err(e) => {
+            eprintln!("Position not found error: {} {}", ts_0, e);
         }
     }
 
     //=========================================================================
 
-    if let Some(r) = db.back()? {
-        println!("Anterior: {}", r.timestamp);
-    } else {
-        println!("Ya estás en el inicio.");
-    }
+    match db.move_to_first() {
+        Ok(Some(record)) => {
+            println!("Moved to first: {}", record.timestamp);
+        }
 
-    if let Some(rec) = db.current()? {
-        println!("Registro actual: {:?}", rec.timestamp);
-    }
+        Ok(None) => {
+            println!("There is no first position");
+        }
 
-    if let Some(r) = db.next()? {
-        println!("Siguiente: {}", r.timestamp);
-    }
-
-    if let Some(rec) = db.current()? {
-        println!("Registro actual: {:?}", rec.timestamp);
-    }
-
-    //=========================================================================
-    let nuevo_ts: i64 = 1715600000;
-    let payload: &[u8; 13] = b"Informacion A";
-
-    // db.append(nuevo_ts, payload)?;
-
-    if db.exists(nuevo_ts)? {
-        println!(
-            "⚠️ El registro con TS {} ya está guardado. Saltando escritura.",
-            nuevo_ts
-        );
-    } else {
-        println!("✅ Registro nuevo. Procediendo a guardar...");
-        db.append(nuevo_ts, payload)?;
-    }
-    //=========================================================================
-    let logs = db.range_around_cursor(10, 10)?;
-    if logs.is_empty() {
-        println!("No se encontraron registros en el rango.");
-    } else {
-        println!("Ventana de {} registros obtenida.", logs.len());
-    }
-
-    //=========================================================================
-
-    if let Some(rec) = db.move_to_first()? {
-        println!("Moviendo first: {:?}", rec.timestamp);
-    }
-
-    let mut count: i32 = 0;
-
-    // Este bucle se detiene si llegamos al final (Ok(None))
-    // pero lanza error si hay corrupción (Err)
-    while count < 5 {
-        if let Some(record) = db.next()? {
-            println!("Iteración {}: Timestamp {}", count, record.timestamp);
-            count += 1;
-        } else {
-            println!("Llegamos al final prematuramente");
-            break;
+        Err(e) => {
+            eprintln!("Moved to first error: {}", e);
         }
     }
 
-    if let Some(rec) = db.current()? {
-        println!("Registro actual: {:?}", rec.timestamp);
+    //=========================================================================
+
+    match db.back() {
+        Ok(Some(record)) => {
+            println!("Moved to back: {}", record.timestamp);
+        }
+
+        Ok(None) => {
+            println!("There is no position back");
+        }
+
+        Err(e) => {
+            eprintln!("Back error: {}", e);
+        }
     }
 
-    match db.move_to_last()? {
-        Some(record) => println!("Moved to last:   {}", record.timestamp),
-        None => println!("Database empty"),
+    //=========================================================================
+
+    match db.next() {
+        Ok(Some(_r)) => println!("Moved to next"),
+        Ok(None) => println!("No more records following"),
+
+        Err(e) => eprintln!("Moved to next error: {}", e),
     }
 
-    if let Some(rec) = db.current()? {
-        println!("Registro actual: {:?}", rec.timestamp);
+    //=========================================================================
+
+    match db.range_around_cursor(0, total_records as u64) {
+        Ok(records) => {
+            if records.is_empty() {
+                println!("Empty range");
+            } else {
+                println!("Range records query: {}", records.len());
+
+                for record in records {
+                    println!("  Timestamp: {}", record.timestamp,);
+                }
+            }
+        }
+        Err(e) => eprintln!("Range error: {}", e),
     }
 
+    //=========================================================================
+
+    match db.move_to_last() {
+        Ok(Some(record)) => {
+            println!("Moved to last: {}", record.timestamp);
+        }
+
+        Ok(None) => {
+            println!("There is no last record");
+        }
+
+        Err(e) => {
+            eprintln!("Moved to last error: {}", e);
+        }
+    }
+
+    //=========================================================================
     Ok(())
 }
