@@ -2,6 +2,13 @@
 name = "cursor_db"
 version = "0.1.0"
 edition = "2024"
+authors = ["JUAN CABALLERO <sudo.delete.evil@gmail.com>"]
+description = "Cursor-based database engine. Append-only. Deterministic. Sparse index. Timestamp primary index."
+license = "GPLv3"
+repository = "https://github.com/rey-sudo"
+readme = "README.md"
+keywords = ["database", "storage", "timeseries", "cursor"]
+categories = ["database", "cursor"]
 
 [dependencies]
 crc32fast = "1.5.0"
