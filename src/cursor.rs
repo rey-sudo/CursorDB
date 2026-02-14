@@ -62,9 +62,7 @@ pub struct CursorDB {
     /// The "high-water mark" of the database.
     /// Points to the exact byte where the last valid record ends.
     /// Used by health checks (stats) to detect orphan data or corruption.
-    last_valid_offset: u64,
-
-    data_path: String,
+    last_valid_offset: u64
 }
 
 #[derive(Debug)]
@@ -293,8 +291,7 @@ impl CursorDB {
             current_row: 0,
             current_offset: 0,
             total_rows: 0,
-            last_valid_offset: 0,
-            data_path: data_path.to_string(),
+            last_valid_offset: 0
         };
 
         if db.total_rows() > 0 {
