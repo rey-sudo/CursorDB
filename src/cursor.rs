@@ -1583,4 +1583,78 @@ mod tests {
         fs::remove_file(index_path)?;
         Ok(())
     }
+
+    #[test]
+    fn test_stride_boundaries_manual_paths() -> std::io::Result<()> {
+        let data_path = "test_stride.cdb";
+        let index_path = "test_stride.cdbi";
+
+        // Limpieza inicial por si acaso quedaron archivos de un test fallido anterior
+        let _ = fs::remove_file(data_path);
+        let _ = fs::remove_file(index_path);
+
+        {
+            let mut db = CursorDB::open_or_create(data_path, index_path)?;
+
+            // 1. Insertamos 2050 registros.
+            // Con INDEX_STRIDE = 1024, se crearán marcas en:
+            // - Row 0 (Offset 0)
+            // - Row 1024 (Offset X)
+            // - Row 2048 (Offset Y)
+            let total_records = 2050;
+            for i in 0..total_records {
+                // Usamos el índice como timestamp para validación directa
+                db.append(i as i64, format!("payload_{:04}", i).as_bytes())?;
+            }
+
+            // Validamos que el índice en memoria tenga 3 entradas
+            assert_eq!(
+                db.index_len(),
+                3,
+                "El índice debería tener marcas para 0, 1024 y 2048"
+            );
+
+            // --- CASO 1: Salto exacto al segundo bloque del índice (Row 1024) ---
+            let rec = db
+                .move_cursor_at(1024)?
+                .expect("Debería encontrar la frontera");
+            assert_eq!(db.current_row(), 1024);
+            assert_eq!(rec.timestamp, 1024);
+
+            // --- CASO 2: Salto al inicio y caminata larga (Row 1023) ---
+            // Este test confirma que el salto no se pasa de largo
+            let _rec = db
+                .move_cursor_at(1023)?
+                .expect("Debería encontrar el registro previo a la frontera");
+            assert_eq!(db.current_row(), 1023);
+
+            // --- CASO 3: Salto al segundo bloque y caminata mínima (Row 1025) ---
+            let _rec = db
+                .move_cursor_at(1025)?
+                .expect("Debería encontrar el registro posterior a la frontera");
+            assert_eq!(db.current_row(), 1025);
+
+            // --- CASO 4: El último registro (Row 2049) ---
+            let _rec = db
+                .move_cursor_at(2049)?
+                .expect("Debería encontrar el último registro");
+            assert_eq!(db.current_row(), 2049);
+
+            // --- CASO 5: Verificación de consistencia del cursor tras fallo ---
+            let row_before = db.current_row();
+            let res = db.move_cursor_at(9999); // Timestamp inexistente
+            assert!(res?.is_none());
+            assert_eq!(
+                db.current_row(),
+                row_before,
+                "El cursor no debe moverse si la búsqueda falla"
+            );
+        }
+
+        // Limpieza final
+        fs::remove_file(data_path)?;
+        fs::remove_file(index_path)?;
+
+        Ok(())
+    }
 }
