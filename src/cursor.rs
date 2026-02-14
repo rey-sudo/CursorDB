@@ -9,6 +9,7 @@ use std::{fmt, fs};
 
 const INDEX_STRIDE: u64 = 1024;
 const MAX_PAYLOAD_SIZE: usize = 16 * 1024 * 1024;
+const MAX_PAGE_SIZE: u64 = 10_000;
 
 /// Represents a pointer in the sparse index of the database.
 ///
@@ -849,12 +850,23 @@ impl CursorDB {
             return Ok(Vec::new());
         }
 
+        // 1. Protección contra rangos excesivos
+        // No permitimos pedir más registros de los que existen en total.
+        // Esto protege el Vec::with_capacity que ocurre dentro de execute_range_scan.
+        let before_safe = before.min(self.total_rows);
+        let after_safe = after.min(self.total_rows);
+
+        // 2. Opcional: Límite de cortesía (puedes ajustarlo según tu RAM)
+        // Evita que un error de lógica reserve memoria para un millón de registros de golpe.
+        let before_safe = before_safe.min(MAX_PAGE_SIZE);
+        let after_safe = after_safe.min(MAX_PAGE_SIZE);
+
         // Guardar estado inicial para restaurarlo al final
         let saved_row = self.current_row;
         let saved_offset = self.current_offset;
 
-        // Usamos un patrón de "defer" manual para asegurar la restauración incluso si hay errores
-        let result = self.execute_range_scan(before, after);
+        // 3. Ejecutar con los valores saneados
+        let result = self.execute_range_scan(before_safe, after_safe);
 
         // Restaurar siempre el cursor original
         self.current_row = saved_row;
