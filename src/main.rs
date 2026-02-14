@@ -1,45 +1,42 @@
 use cursor_db::cursor::CursorDB;
 use cursor_db::cursor::DBStats;
-use std::fs;
-use std::path::Path;
-use std::thread;
-use std::time::Duration;
 
 fn main() -> std::io::Result<()> {
-    // Definimos las rutas
-    let data_path: &str = "data/data.cdb";
-    let index_path: &str = "data/index.cdbi";
+    // Define file paths
+    let data_path: &str = "../data/data.cdb";
+    let index_path: &str = "../data/index.cdbi";
 
-    // 1. BORRAR ARCHIVOS PREVIOS (Clean Start)
-    // Usamos un pequeño closure para ignorar el error si el archivo no existe
-    for path in &[data_path, index_path] {
-        if Path::new(path).exists() {
-            fs::remove_file(path)?;
-            println!("Deleted old file: {}", path);
-        }
-    }
+    // Create database
+    let mut db: CursorDB = CursorDB::open_or_create(data_path, index_path)?;
 
-    // Asegurarse de que el directorio existe
-    if let Some(parent) = Path::new(data_path).parent() {
-        fs::create_dir_all(parent)?;
-    }
-
-    //==================================================================
-    let mut db: CursorDB = CursorDB::open_or_create("data/data.cdb", "data/index.cdbi")?;
-
+    // Create records
     for i in 0..20 {
-        let timestamp = 1_000_000_000 + i;
-        let payload = format!("payload-{}", i).into_bytes();
+        let timestamp: i64 = 1_000_000_000 + i;
+        let payload: Vec<u8> = format!("payload-{}", i).into_bytes();
         db.append(timestamp, &payload)?;
     }
 
-    thread::sleep(Duration::from_millis(500));
-
+    //Display stats
     let stats: DBStats = db.stats()?;
     println!("{}", stats);
 
+    //=========================================================================
+
+    match db.current() {
+        Ok(Some(rec)) => {
+            println!("Current position: {:?}", rec.timestamp);
+        }
+        Ok(None) => {
+            println!("The position does not exist");
+        }
+        Err(e) => {
+            eprintln!("Error: {}", e);
+        }
+    }
+
+    //=========================================================================
+
     match db.move_cursor_at(0)? {
-        // El '?' maneja el error de disco/CRC
         Some(r) => println!("Encontrado: {}", r.timestamp),
         None => {
             println!("Timestamp fuera de rango moviendo a first");

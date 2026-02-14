@@ -1,10 +1,11 @@
 use crate::record::Record;
 use crc32fast::Hasher;
-use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::io::{Error, ErrorKind, Result};
 use std::io::{Read, Seek, SeekFrom};
+use std::path::Path;
+use std::{fmt, fs};
 
 const INDEX_STRIDE: u64 = 1024;
 const MAX_PAYLOAD_SIZE: usize = 16 * 1024 * 1024;
@@ -61,7 +62,7 @@ pub struct CursorDB {
     /// The "high-water mark" of the database.
     /// Points to the exact byte where the last valid record ends.
     /// Used by health checks (stats) to detect orphan data or corruption.
-    last_valid_offset: u64
+    last_valid_offset: u64,
 }
 
 #[derive(Debug)]
@@ -179,6 +180,14 @@ impl CursorDB {
         self.index.clear();
     }
 
+    pub fn is_eof(&self) -> bool {
+        self.current_row >= self.total_rows
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.total_rows == 0
+    }
+
     pub fn calculate_orphan_data_ratio(&mut self) -> std::io::Result<f64> {
         let file_len = self.data_file.metadata()?.len();
         if file_len == 0 {
@@ -253,7 +262,6 @@ impl CursorDB {
     }
 
     /// Opens the database files or creates them if they do not exist.
-    ///
     /// This constructor initializes the raw data storage and the sparse index tracker.
     /// It assumes a "pure data" format where the record stream begins at the very
     /// first byte of the file (offset 0).
@@ -268,6 +276,21 @@ impl CursorDB {
     /// * Initializes the cursor at the "Kilometer Zero" (offset 0, row 0).
     /// * Triggers an immediate `load_index()` to reconcile memory state with disk content.
     pub fn open_or_create(data_path: &str, index_path: &str) -> std::io::Result<Self> {
+        // Iterate through both data and index paths to ensure their hosting directories exist
+        for path_str in &[data_path, index_path] {
+            let path: &Path = Path::new(path_str);
+
+            // Extract the parent directory from the provided path
+            if let Some(parent) = path.parent() {
+                // Only attempt to create directories if the path isn't just a filename
+                // (i.e., it actually contains a folder structure)
+                if !parent.as_os_str().is_empty() {
+                    // Recursively create all missing directories in the path
+                    fs::create_dir_all(parent)?;
+                }
+            }
+        }
+
         // Open the primary data container. CRW access is required for cursor-based navigation.
         let data_file: File = OpenOptions::new()
             .create(true)
@@ -290,7 +313,7 @@ impl CursorDB {
             current_row: 0,
             current_offset: 0,
             total_rows: 0,
-            last_valid_offset: 0
+            last_valid_offset: 0,
         };
 
         if db.total_rows() > 0 {
@@ -503,7 +526,7 @@ impl CursorDB {
 
     pub fn current(&mut self) -> std::io::Result<Option<Record>> {
         // Si no hay registros o el cursor se pasó del final, devolvemos None sin leer el disco
-        if self.total_rows == 0 || self.current_row >= self.total_rows {
+        if self.is_empty() || self.is_eof() {
             return Ok(None);
         }
 
