@@ -1,6 +1,5 @@
 use crate::record::Record;
 use crc32fast::Hasher;
-use std::collections::HashSet;
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
