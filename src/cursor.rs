@@ -588,6 +588,60 @@ impl CursorDB {
         Ok((Record { timestamp, payload }, next_offset))
     }
 
+    pub fn exists(&mut self, ts: i64) -> std::io::Result<bool> {
+        if self.total_rows == 0 {
+            return Ok(false);
+        }
+
+        if let Some(first) = self.index.first() {
+            if ts < first.timestamp && first.row_number == 0 {
+                // Si el primer índice es la fila 0 y el ts es menor, no existe.
+                return Ok(false);
+            }
+        }
+
+        // 1. Localizar el punto de inicio en el índice (O(log N))
+        // Buscamos el último elemento que sea menor o igual al ts solicitado
+        let pos = self
+            .index
+            .partition_point(|e: &IndexEntry| e.timestamp <= ts);
+
+        // Si pos es 0, el ts es menor que el primer registro indexado,
+        // pero podría estar entre el inicio del archivo y el primer índice.
+        let mut search_offset = if pos == 0 {
+            0
+        } else {
+            self.index[pos - 1].file_offset
+        };
+
+        // 2. Guardar posición actual del cursor (para no perder el hilo de lectura)
+        let saved_pos = self.data_file.stream_position()?;
+
+        // 3. Escaneo lineal limitado al hueco entre índices
+        let mut found = false;
+        let file_len = self.data_file.metadata()?.len();
+
+        while search_offset < file_len {
+            let (record, next_off) = self.read_record_at(search_offset)?;
+
+            if record.timestamp == ts {
+                found = true;
+                break;
+            }
+
+            // Si ya nos pasamos del timestamp, no existe (asumiendo orden)
+            if record.timestamp > ts {
+                break;
+            }
+
+            search_offset = next_off;
+        }
+
+        // 4. Restaurar cursor y devolver
+        self.data_file.seek(std::io::SeekFrom::Start(saved_pos))?;
+        Ok(found)
+    }
+
     pub fn next(&mut self) -> std::io::Result<Option<Record>> {
         // 1. Si ya procesamos todas las filas, no hay nada más que leer
         // Nota: Si current_row es 0 y total_rows es 1, aún debemos leer la fila 0.

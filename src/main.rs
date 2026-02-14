@@ -68,7 +68,21 @@ fn main() -> std::io::Result<()> {
     }
 
     //=========================================================================
+    let nuevo_ts: i64 = 1715600000;
+    let payload: &[u8; 13] = b"Informacion A";
 
+    // db.append(nuevo_ts, payload)?;
+
+    if db.exists(nuevo_ts)? {
+        println!(
+            "⚠️ El registro con TS {} ya está guardado. Saltando escritura.",
+            nuevo_ts
+        );
+    } else {
+        println!("✅ Registro nuevo. Procediendo a guardar...");
+        db.append(nuevo_ts, payload)?;
+    }
+    //=========================================================================
     let logs = db.range_around_cursor(10, 10)?;
     if logs.is_empty() {
         println!("No se encontraron registros en el rango.");
