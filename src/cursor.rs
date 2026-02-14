@@ -482,7 +482,6 @@ impl CursorDB {
                 self.current_row = self.total_rows - 1;
                 self.current_offset = initial_data_size;
 
-                println!("DEBUG: initial_data_size {}", initial_data_size);
                 Ok(())
             }
             Err(e) => {
@@ -716,11 +715,6 @@ impl CursorDB {
         // Actualizamos el estado interno al primer registro.
         self.current_row = 0;
         self.current_offset = target_offset;
-
-        println!(
-            "DEBUG: Moviendo a row {} en offset {}",
-            self.current_row, self.current_offset
-        );
 
         Ok(Some(record))
     }
@@ -1507,6 +1501,62 @@ mod tests {
 
         let _ = fs::remove_file(format!("{}", data_path));
         let _ = fs::remove_file(format!("{}", index_path));
+        Ok(())
+    }
+
+    #[test]
+    fn test_exists_logic() -> std::io::Result<()> {
+        let data_path = "test_exists.cdb";
+        let index_path = "test_exists.cdbi";
+
+        // Limpieza previa
+        let _ = fs::remove_file(data_path);
+        let _ = fs::remove_file(index_path);
+
+        {
+            let mut db = CursorDB::open_or_create(data_path, index_path)?;
+
+            // 1. Insertamos datos con huecos para forzar el índice disperso
+            // Si tu INDEX_STRIDE es por ejemplo 5, insertaremos 12 para tener 3 bloques.
+            for i in 1..=12 {
+                let ts = (i * 10) as i64; // Timestamps: 10, 20, 30... 120
+                db.append(ts, format!("Payload {}", i).as_bytes())?;
+            }
+
+            // CASO A: Existe y está justo en el índice (Punto de salto)
+            // El primer registro (10) siempre suele estar indexado.
+            assert!(db.exists(10)?, "Debería encontrar el primer registro");
+
+            // CASO B: Existe pero está en un "HUECO" del disco
+            // Si el índice salta cada 5, el TS 30 (fila 3) no está en el índice,
+            // pero el método debe encontrarlo escaneando el bloque.
+            assert!(
+                db.exists(30)?,
+                "Debería encontrar un registro no indexado mediante escaneo lineal del bloque"
+            );
+
+            // CASO C: El último registro
+            assert!(db.exists(120)?, "Debería encontrar el último registro");
+
+            // CASO D: NO EXISTE (Timestamp menor al mínimo)
+            assert!(!db.exists(5)?, "No debería encontrar un TS menor al rango");
+
+            // CASO E: NO EXISTE (Timestamp en medio de dos existentes)
+            assert!(
+                !db.exists(25)?,
+                "No debería encontrar un TS inexistente entre dos existentes"
+            );
+
+            // CASO F: NO EXISTE (Timestamp mayor al máximo)
+            assert!(
+                !db.exists(500)?,
+                "No debería encontrar un TS fuera del límite superior"
+            );
+        }
+
+        // Limpieza final
+        fs::remove_file(data_path)?;
+        fs::remove_file(index_path)?;
         Ok(())
     }
 }
