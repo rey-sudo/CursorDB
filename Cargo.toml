@@ -8,7 +8,7 @@ license = "GPL-3.0"
 repository = "https://github.com/rey-sudo"
 readme = "README.md"
 keywords = ["database", "storage", "timeseries", "cursor"]
-categories = ["database", "cursor"]
+categories = ["database-implementations", "data-structures"]
 
 [dependencies]
 crc32fast = "1.5.0"
