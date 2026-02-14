@@ -16,7 +16,7 @@ fn main() -> std::io::Result<()> {
     }
 
     //=========================================================================
-    
+
     // Create database
     let mut db: CursorDB = CursorDB::open_or_create(data_path, index_path)?;
 
@@ -120,12 +120,20 @@ fn main() -> std::io::Result<()> {
 
     //=========================================================================
 
-    match db.range_around_cursor(0, total_records as u64) {
+    let before: u64 = 0;
+    let after: u64 = total_records as u64;
+
+    match db.range_around_cursor(before, after) {
         Ok(records) => {
             if records.is_empty() {
                 println!("Empty range");
             } else {
-                println!("Range records query: {}", records.len());
+                println!(
+                    "Range around cursor: {}..{} {}",
+                    before,
+                    after,
+                    records.len()
+                );
 
                 for record in records {
                     println!("  Timestamp: {}", record.timestamp,);

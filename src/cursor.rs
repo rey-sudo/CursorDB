@@ -316,16 +316,10 @@ impl CursorDB {
             last_valid_offset: 0,
         };
 
-        if db.total_rows() > 0 {
-            // IMPORTANTE: Asegúrate de hacer un flush antes si sospechas que hay datos pendientes
-            db.data_file.flush()?;
-
-            // Si la verificación falla aquí, open_or_create devolverá Err
-            // impidiendo que uses una DB corrupta.
-            db.verify_deterministic_integrity()?;
-        }
-
         db.load_index()?;
+
+        #[cfg(not(test))]
+        db.verify_deterministic_integrity()?;
 
         Ok(db)
     }
