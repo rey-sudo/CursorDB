@@ -511,6 +511,23 @@ impl CursorDB {
         }
     }
 
+    pub fn insert(&mut self, timestamp: i64, payload: &[u8]) -> std::io::Result<()> {
+        // 1. Verificación de existencia previa
+        // exists() ya utiliza el índice disperso (O(log n)), por lo que es eficiente.
+        if self.exists(timestamp)? {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!(
+                    "El registro con timestamp {} ya existe en la base de datos",
+                    timestamp
+                ),
+            ));
+        }
+
+        // 2. Si no existe, procedemos con el append (ahora privado)
+        self.append(timestamp, payload)
+    }
+
     pub fn current(&mut self) -> std::io::Result<Option<Record>> {
         // Si no hay registros o el cursor se pasó del final, devolvemos None sin leer el disco
         if self.is_empty() || self.is_eof() {
@@ -1655,6 +1672,42 @@ mod tests {
         fs::remove_file(data_path)?;
         fs::remove_file(index_path)?;
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_insert_unique_logic() -> std::io::Result<()> {
+        let data_path = "test_unique.cdb";
+        let index_path = "test_unique.cdbi";
+        let _ = std::fs::remove_file(data_path);
+        let _ = std::fs::remove_file(index_path);
+
+        {
+            let mut db = CursorDB::open_or_create(data_path, index_path)?;
+
+            // Primera inserción: Debe funcionar
+            db.insert(1000, b"original")?;
+            assert_eq!(db.total_rows(), 1);
+
+            // Intento de duplicado: Debe fallar
+            let result = db.insert(1000, b"duplicado");
+
+            assert!(result.is_err());
+            assert_eq!(
+                result.unwrap_err().kind(),
+                std::io::ErrorKind::AlreadyExists
+            );
+
+            // El total de filas no debe haber cambiado
+            assert_eq!(db.total_rows(), 1);
+
+            // Inserción de un timestamp distinto: Debe funcionar
+            db.insert(1001, b"nuevo")?;
+            assert_eq!(db.total_rows(), 2);
+        }
+
+        let _ = std::fs::remove_file(data_path);
+        let _ = std::fs::remove_file(index_path);
         Ok(())
     }
 }

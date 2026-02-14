@@ -27,16 +27,12 @@ fn main() -> std::io::Result<()> {
         let timestamp: i64 = 1_000_000_000 + i;
         let payload: Vec<u8> = format!("payload-{}", i).into_bytes();
 
-        match db.exists(timestamp) {
-            Ok(true) => {
-                println!("🗙 Already exists: {}", timestamp);
-            }
-            Ok(false) => {
-                db.append(timestamp, &payload)?;
-                println!("✔ New Record Saved: {}", timestamp);
+        match db.insert(timestamp, &payload) {
+            Ok(_) => {
+                println!("✔ Record Saved: TS {}", timestamp);
             }
             Err(e) => {
-                eprintln!("🗙 Error checking existence: {}", e);
+                eprintln!("🗙 Insert Error: {}", e);
             }
         }
     }
