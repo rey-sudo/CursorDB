@@ -18,7 +18,7 @@ cursordb = "0.1.0"
 
 ## Quick Start
 
-```
+```rust
     // Define file paths
     let data_path: &str = "../data/data.cdb";
     let index_path: &str = "../data/index.cdbi";
@@ -33,7 +33,7 @@ cursordb = "0.1.0"
     //=========================================================================
 
     // Create database
-    let mut db: CursorDB = CursorDB::open_or_create(data_path, index_path)?;
+    let mut db: CursorDB = CursorDB::new(data_path, index_path)?;
 
     let total_records: u64 = 20;
 

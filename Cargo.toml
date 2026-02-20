@@ -1,8 +1,8 @@
 [package]
 name = "cursor_db"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
-authors = ["JUAN CABALLERO <sudo.delete.evil@gmail.com>"]
+authors = ["Juan Caballero <sudo.delete.evil@gmail.com>"]
 description = "Cursor-based database engine. Append-only. Deterministic. Sparse index. Timestamp primary index."
 license = "GPL-3.0"
 repository = "https://github.com/rey-sudo"
@@ -12,3 +12,4 @@ categories = ["database-implementations", "data-structures"]
 
 [dependencies]
 crc32fast = "1.5.0"
+serde = { version = "1.0.228", features = ["derive"] }

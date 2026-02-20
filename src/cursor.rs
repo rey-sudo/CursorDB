@@ -160,6 +160,10 @@ impl fmt::Display for DBStats {
 }
 
 impl CursorDB {
+    pub fn new(data_path: &str, index_path: &str) -> std::io::Result<Self> {
+        Self::open_or_create(data_path, index_path)
+    }
+
     /// Returns the current logical row index where the cursor is positioned.
     pub fn current_row(&self) -> u64 {
         self.current_row

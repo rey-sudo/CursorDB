@@ -1,3 +1,6 @@
+use serde::{Serialize, Deserialize};
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Record {
     pub timestamp: i64,
     pub payload: Vec<u8>,
