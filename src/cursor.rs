@@ -1,5 +1,6 @@
 use crate::record::Record;
 use crc32fast::Hasher;
+use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::io::{Error, ErrorKind, Result};
@@ -16,7 +17,7 @@ const MAX_PAGE_SIZE: u64 = 10_000;
 /// Instead of mapping every single record, the sparse index stores "navigational markers"
 /// at fixed intervals. This allows the engine to use binary search to jump to a
 /// specific neighborhood in the file, significantly reducing linear scan time.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct IndexEntry {
     /// The logical zero-based sequence number of the record 8-bytes.
     ///
@@ -40,6 +41,7 @@ pub struct IndexEntry {
 ///
 /// It coordinates a primary data file and a sparse index to allow efficient
 /// O(1) writes and fast O(log n) searches via binary search.
+#[derive(Debug)]
 pub struct CursorDB {
     /// The primary handle for the binary data file (.cdb).
     /// Stores the actual record payloads and headers.
