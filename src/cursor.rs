@@ -444,6 +444,26 @@ impl CursorDB {
         Ok(())
     }
 
+    pub fn get_first_record(&mut self) -> std::io::Result<Option<Record>> {
+        if self.total_rows == 0 {
+            return Ok(None);
+        }
+
+        // El primer registro siempre está en el offset 0
+        let (record, _) = self.read_record_at(0)?;
+        Ok(Some(record))
+    }
+
+    pub fn get_last_record(&mut self) -> std::io::Result<Option<Record>> {
+        if self.total_rows == 0 {
+            return Ok(None);
+        }
+
+        // Usamos el offset que reconciliamos previamente para ir directo al final
+        let (record, _) = self.read_record_at(self.last_valid_offset)?;
+        Ok(Some(record))
+    }
+
     pub fn append(&mut self, timestamp: i64, payload: &[u8]) -> std::io::Result<()> {
         // 1. CAPTURAR ESTADO INICIAL PARA POSIBLE ROLLBACK
         // Guardamos las posiciones actuales para poder truncar si algo falla
@@ -1714,6 +1734,96 @@ mod tests {
 
         let _ = std::fs::remove_file(data_path);
         let _ = std::fs::remove_file(index_path);
+        Ok(())
+    }
+
+    #[test]
+    fn test_first_and_last_records() -> std::io::Result<()> {
+        let db_path: &str = "test_extremes.cdb";
+        let idx_path: &str = "test_extremes.cdbi";
+
+        // 1. Configuración: Limpiar archivos previos y abrir DB
+        let _ = fs::remove_file(db_path);
+        let _ = fs::remove_file(idx_path);
+
+        {
+            let mut db: CursorDB = CursorDB::open_or_create(db_path, idx_path)?;
+
+            // 2. Probar con DB vacía
+            assert!(db.get_first_record()?.is_none());
+            assert!(db.get_last_record()?.is_none());
+
+            // 3. Insertar registros
+            let first_ts = 1000;
+            let last_ts = 9000;
+
+            db.insert(first_ts, b"payload-0")?;
+
+            db.insert(5000, b"payload-5000")?;
+            db.insert(5001, b"payload-5001")?;
+
+            db.insert(last_ts, b"payload-2")?;
+
+            // 4. Validar extremos
+            let first = db
+                .get_first_record()?
+                .expect("Debería existir el primer registro");
+            let last = db
+                .get_last_record()?
+                .expect("Debería existir el último registro");
+
+            assert_eq!(first.timestamp, first_ts);
+            assert_eq!(first.payload, b"payload-0");
+
+            assert_eq!(last.timestamp, last_ts);
+            assert_eq!(last.payload, b"payload-2");
+
+            // 5. Verificar que el cursor NO se movió (si estaba en 0, sigue en 0)
+            // Esto asegura que get_first/last son métodos "puros" de lectura
+            assert_eq!(db.current_row, 3);
+        }
+
+        // Limpieza final
+        fs::remove_file(db_path)?;
+        fs::remove_file(idx_path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_initial_cursor_position_on_open() -> std::io::Result<()> {
+        let db_path = "test_init.cdb";
+        let idx_path = "test_init.cdbi";
+
+        // 1. Preparamos la DB con datos y la cerramos
+        {
+            let mut db = CursorDB::open_or_create(db_path, idx_path)?;
+            db.append(1000, b"primer-registro")?;
+            db.append(2000, b"segundo-registro")?;
+            // Al final de esta sesión, el cursor estaría en el registro 1 (el segundo)
+        }
+
+        // 2. Reabrimos la DB (Aquí ocurre la magia de la inicialización)
+        {
+            let mut db = CursorDB::open_or_create(db_path, idx_path)?;
+
+            // Obtenemos ambos registros
+            let first_record = db.get_first_record()?.expect("Debería existir el primero");
+            let current_record = db
+                .current()?
+                .expect("El cursor debería tener un registro inicial");
+
+            // 3. Verificamos que sean el mismo
+            assert_eq!(current_record.timestamp, first_record.timestamp);
+            assert_eq!(current_record.payload, first_record.payload);
+
+            // Verificamos que el índice lógico sea efectivamente 0
+            assert_eq!(db.current_row, 0);
+            assert_eq!(db.current_offset, 0);
+        }
+
+        // Limpieza
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(idx_path);
         Ok(())
     }
 }
