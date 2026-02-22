@@ -1826,4 +1826,86 @@ mod tests {
         let _ = std::fs::remove_file(idx_path);
         Ok(())
     }
+
+    #[test]
+    fn test_cursor_boundary_limits() -> std::io::Result<()> {
+        let db_path = "test_limits.cdb";
+        let idx_path = "test_limits.cdbi";
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(idx_path);
+
+        {
+            let mut db = CursorDB::open_or_create(db_path, idx_path)?;
+            db.append(1000, b"primero")?; // Fila 0
+            db.append(2000, b"segundo")?; // Fila 1
+
+            db.move_to_first()?; // Aseguramos posición 0
+
+            // Primera llamada: devuelve el registro 0, cursor va a 1
+            assert!(db.next()?.is_some());
+            assert_eq!(db.current_row, 1);
+
+            // Segunda llamada: devuelve el registro 1, cursor va a 2
+            assert!(db.next()?.is_some());
+            assert_eq!(db.current_row, 2);
+
+            // TERCERA llamada: Ya no hay registro 2, debe ser None
+            let result = db.next()?;
+            assert!(
+                result.is_none(),
+                "Next debe ser None porque current_row (2) == total_rows (2)"
+            );
+        }
+
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(idx_path);
+        Ok(())
+    }
+
+    #[test]
+    fn test_back_boundary_and_logic() -> std::io::Result<()> {
+        let db_path = "test_back_logic.cdb";
+        let idx_path = "test_back_logic.cdbi";
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(idx_path);
+
+        {
+            let mut db = CursorDB::open_or_create(db_path, idx_path)?;
+            db.append(1000, b"registro-0")?; // Fila 0
+            db.append(2000, b"registro-1")?; // Fila 1
+            db.append(3000, b"registro-2")?; // Fila 2
+
+            // 1. Empezamos al final (Fila 2)
+            db.move_to_last()?;
+            assert_eq!(db.current_row, 2);
+
+            // 2. Primer back():
+            // Salta de la 2 a la 1. Devuelve el registro 1.
+            let res1 = db.back()?;
+            assert!(res1.is_some());
+            assert_eq!(res1.unwrap().timestamp, 2000);
+            assert_eq!(db.current_row, 1);
+
+            // 3. Segundo back():
+            // Salta de la 1 a la 0. Devuelve el registro 0.
+            let res2 = db.back()?;
+            assert!(res2.is_some());
+            assert_eq!(res2.unwrap().timestamp, 1000);
+            assert_eq!(db.current_row, 0);
+
+            // 4. Tercer back():
+            // Ya estamos en la fila 0. No hay nada antes de la 0.
+            // Debe devolver None y mantener el cursor en 0.
+            let res3 = db.back()?;
+            assert!(
+                res3.is_none(),
+                "Back debe ser None cuando ya estamos en el primer registro"
+            );
+            assert_eq!(db.current_row, 0);
+        }
+
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(idx_path);
+        Ok(())
+    }
 }
