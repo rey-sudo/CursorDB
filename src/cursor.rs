@@ -1908,4 +1908,126 @@ mod tests {
         let _ = std::fs::remove_file(idx_path);
         Ok(())
     }
+
+    #[test]
+    fn test_cursor_zigzag_consistency() -> std::io::Result<()> {
+        let db_path = "test_zigzag.cdb";
+        let idx_path = "test_zigzag.cdbi";
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(idx_path);
+
+        {
+            let mut db = CursorDB::open_or_create(db_path, idx_path)?;
+            db.append(1000, b"reg-0")?;
+            db.append(2000, b"reg-1")?;
+            db.append(3000, b"reg-2")?;
+
+            db.move_to_first()?; // Cursor en Fila 0
+
+            // 1. Avanzamos: next() lee 0 y pone el cursor en 1
+            let n1 = db.next()?.unwrap();
+            assert_eq!(n1.timestamp, 1000);
+            assert_eq!(db.current_row, 1);
+
+            // 2. Retrocedemos: back() mueve de 1 a 0 y lee 0
+            // (Probamos si volver al inicio funciona bien tras un next)
+            let b1 = db.back()?.unwrap();
+            assert_eq!(b1.timestamp, 1000);
+            assert_eq!(db.current_row, 0);
+
+            // 3. El Zigzag real:
+            db.next()?; // Saltamos el 0, cursor en 1
+            db.next()?; // Saltamos el 1, cursor en 2
+
+            // Ahora estamos en la fila 2.
+            // Si llamamos a back(), deberíamos obtener el registro 1 y quedar en la fila 1.
+            let back_to_1 = db.back()?.unwrap();
+            assert_eq!(back_to_1.timestamp, 2000);
+            assert_eq!(db.current_row, 1);
+
+            // Si ahora llamamos a next(), deberíamos obtener OTRA VEZ el registro 1
+            // (Porque el cursor está en la fila 1) y quedar en la fila 2.
+            let next_again_1 = db.next()?.unwrap();
+            assert_eq!(next_again_1.timestamp, 2000);
+            assert_eq!(db.current_row, 2);
+        }
+
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(idx_path);
+        Ok(())
+    }
+
+    #[test]
+    fn test_persistence_consistency_warm_vs_cold() -> std::io::Result<()> {
+        let db_path = "test_persistence.cdb";
+        let idx_path = "test_persistence.cdbi";
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(idx_path);
+
+        let mut first_ts_warm = 0;
+        let mut last_ts_warm = 0;
+        let mut total_rows_warm = 0;
+
+        // --- ESCENARIO 1: EN CALIENTE (Justo después de append) ---
+        {
+            let mut db = CursorDB::open_or_create(db_path, idx_path)?;
+            db.append(1000, b"payload-0")?;
+            db.append(2000, b"payload-1")?;
+            db.append(3000, b"payload-2")?;
+
+            // Capturamos el estado antes de cerrar
+            first_ts_warm = db.get_first_record()?.unwrap().timestamp;
+            last_ts_warm = db.get_last_record()?.unwrap().timestamp;
+            total_rows_warm = db.total_rows;
+
+            // Verificamos que en caliente el cursor está al final (según tu implementación)
+            assert_eq!(db.current_row, 2);
+        } // Aquí la DB se cierra y se hace flush a disco
+
+        // --- ESCENARIO 2: EN FRÍO (Reabriendo la base de datos) ---
+        {
+            let mut db = CursorDB::open_or_create(db_path, idx_path)?;
+
+            // 1. Validar que los datos básicos coinciden
+            assert_eq!(
+                db.total_rows, total_rows_warm,
+                "El número de filas debe persistir"
+            );
+
+            let first_cold = db.get_first_record()?.unwrap();
+            let last_cold = db.get_last_record()?.unwrap();
+
+            assert_eq!(
+                first_cold.timestamp, first_ts_warm,
+                "El primer registro debe ser idéntico"
+            );
+            assert_eq!(
+                last_cold.timestamp, last_ts_warm,
+                "El último registro debe ser idéntico"
+            );
+
+            // 2. Validar comportamiento del cursor (Reset esperado)
+            // Al reabrir, el cursor siempre vuelve a 0 (inicio), a diferencia de tras el append.
+            assert_eq!(
+                db.current_row, 0,
+                "Al reabrir, el cursor debe resetearse a 0"
+            );
+
+            // 3. Validar navegación en frío
+            // Si hacemos next(), debería darnos el primer registro (fila 0) y mover a la 1
+            let record = db.next()?.unwrap();
+            assert_eq!(record.timestamp, 1000);
+            assert_eq!(db.current_row, 1);
+
+            // 4. Validar que el índice disperso cargó bien
+            // Intentamos un back() desde la fila 1 (debe llevarnos a la 0)
+            let back_record = db.back()?.unwrap();
+            assert_eq!(back_record.timestamp, 1000);
+            assert_eq!(db.current_row, 0);
+        }
+
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(idx_path);
+        Ok(())
+    }
 }
